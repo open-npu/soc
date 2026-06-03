@@ -1,0 +1,7 @@
+build/
+obj_dir/
+__pycache__/
+*.o
+*.elf
+*.bin
+*.dis
