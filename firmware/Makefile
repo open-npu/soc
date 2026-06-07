@@ -21,9 +21,21 @@ OBJS   = start.o main.o
 
 TARGET  = firmware
 
-all: $(TARGET).bin $(TARGET).hex
+# Test data (generated from golden)
+TEST_DATA_BIN = test_data.bin
+TEST_DATA_H  = soc_test_data.h
+MAIN_RAM_INIT = main_ram.init
 
-%.o: %.c
+# Sim directory for output files
+SIM_DIR = ../sim
+
+all: $(TARGET).bin $(TARGET).hex $(MAIN_RAM_INIT)
+
+# Generate test data header and binary blob together
+$(TEST_DATA_H) $(TEST_DATA_BIN):
+	python3 gen_soc_test.py
+
+%.o: %.c $(TEST_DATA_H)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 %.o: %.S
@@ -37,12 +49,20 @@ $(TARGET).bin: $(TARGET).elf
 	$(OBJCOPY) -O binary $< $@
 	@echo "Firmware size: $$(wc -c < $@) bytes"
 
-# Generate hex for $readmemh loading into sim
+# Generate hex for $readmemh loading into sim (ROM)
 $(TARGET).hex: $(TARGET).bin
 	od -An -tx4 -v $< | sed 's/^ *//' | tr ' ' '\n' | grep -v '^$$' > $@
 	@echo "Generated $@ ($$(wc -l < $@) words)"
 
+# Build main RAM init: firmware.bin + padding + test_data.bin
+$(MAIN_RAM_INIT): $(TARGET).bin $(TEST_DATA_BIN) build_main_ram.py
+	python3 build_main_ram.py $(TARGET).bin $(TEST_DATA_BIN) $@
+	@# Copy to sim directory
+	@cp $(TARGET).hex $(SIM_DIR)/sim_rom.init
+	@cp $@ $(SIM_DIR)/sim_main_ram.init
+	@echo "Copied sim_rom.init and sim_main_ram.init to $(SIM_DIR)/"
+
 clean:
-	rm -f *.o *.elf *.bin *.hex *.dis
+	rm -f *.o *.elf *.bin *.hex *.dis $(TEST_DATA_BIN) $(MAIN_RAM_INIT) $(TEST_DATA_H)
 
 .PHONY: all clean
