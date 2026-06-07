@@ -447,7 +447,7 @@ void main(void) {
     int global_err = 0;
 
     /* ── Test 1: INT8 MobileNetV2-Tiny ── */
-    uart_puts("\n[TEST 1/14] INT8 MobileNetV2-Tiny (10 layers)\n");
+    uart_puts("\n[TEST 1/16] INT8 MobileNetV2-Tiny (10 layers)\n");
     test_case_t tc_int8 = { BLOB_INT8_BASE, "INT8", 0 };
     int ret_int8 = run_test_case(&tc_int8);
     if (ret_int8 < 0) {
@@ -465,7 +465,7 @@ void main(void) {
     }
 
     /* ── Test 2: INT16 MobileNetV2-Tiny ── */
-    uart_puts("\n[TEST 2/14] INT16 MobileNetV2-Tiny (10 layers)\n");
+    uart_puts("\n[TEST 2/16] INT16 MobileNetV2-Tiny (10 layers)\n");
     test_case_t tc_int16 = { BLOB_INT16_BASE, "INT16", 0 };
     int ret_int16 = run_test_case(&tc_int16);
     if (ret_int16 < 0) {
@@ -484,7 +484,7 @@ void main(void) {
 
     /* ── Pooling operator tests ── */
     {
-        uart_puts("\n[TEST 3/14] Pool Max INT8\n");
+        uart_puts("\n[TEST 3/16] Pool Max INT8\n");
         test_case_t tc = { BLOB_POOL_MAX_INT8_BASE, "Pool Max INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -493,7 +493,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 4/14] Pool Avg INT8\n");
+        uart_puts("\n[TEST 4/16] Pool Avg INT8\n");
         test_case_t tc = { BLOB_POOL_AVG_INT8_BASE, "Pool Avg INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -502,7 +502,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 5/14] Pool Global INT8\n");
+        uart_puts("\n[TEST 5/16] Pool Global INT8\n");
         test_case_t tc = { BLOB_POOL_GLOBAL_INT8_BASE, "Pool Global INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -511,7 +511,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 6/14] Pool Max INT16\n");
+        uart_puts("\n[TEST 6/16] Pool Max INT16\n");
         test_case_t tc = { BLOB_POOL_MAX_INT16_BASE, "Pool Max INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -521,7 +521,7 @@ void main(void) {
 
     /* ── Resize operator tests ── */
     {
-        uart_puts("\n[TEST 7/14] Resize Nearest INT8\n");
+        uart_puts("\n[TEST 7/16] Resize Nearest INT8\n");
         test_case_t tc = { BLOB_RESIZE_NEAREST_INT8_BASE, "Resize Nearest INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -530,7 +530,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 8/14] Resize Bilinear INT16\n");
+        uart_puts("\n[TEST 8/16] Resize Bilinear INT16\n");
         test_case_t tc = { BLOB_RESIZE_BILINEAR_INT16_BASE, "Resize Bilinear INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -540,7 +540,7 @@ void main(void) {
 
     /* ── Deconv operator tests ── */
     {
-        uart_puts("\n[TEST 9/14] Deconv INT8\n");
+        uart_puts("\n[TEST 9/16] Deconv INT8\n");
         test_case_t tc = { BLOB_DECONV_INT8_BASE, "Deconv INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -549,7 +549,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 10/14] Deconv INT16\n");
+        uart_puts("\n[TEST 10/16] Deconv INT16\n");
         test_case_t tc = { BLOB_DECONV_INT16_BASE, "Deconv INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -559,7 +559,7 @@ void main(void) {
 
     /* ── Concat operator tests ── */
     {
-        uart_puts("\n[TEST 11/14] Concat INT8\n");
+        uart_puts("\n[TEST 11/16] Concat INT8\n");
         test_case_t tc = { BLOB_CONCAT_INT8_BASE, "Concat INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -568,7 +568,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 12/14] Concat INT16\n");
+        uart_puts("\n[TEST 12/16] Concat INT16\n");
         test_case_t tc = { BLOB_CONCAT_INT16_BASE, "Concat INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -578,7 +578,7 @@ void main(void) {
 
     /* ── Add operator tests ── */
     {
-        uart_puts("\n[TEST 13/14] Eltwise Add INT8\n");
+        uart_puts("\n[TEST 13/16] Eltwise Add INT8\n");
         test_case_t tc = { BLOB_ADD_INT8_BASE, "Add INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -587,12 +587,49 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 14/14] Eltwise Add INT16\n");
+        uart_puts("\n[TEST 14/16] Eltwise Add INT16\n");
         test_case_t tc = { BLOB_ADD_INT16_BASE, "Add INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
         else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
         else { uart_puts("  PASS ✓\n"); }
+    }
+
+    /* ── AllOps-Mini full model (18 layers, all 7 operators) ── */
+    {
+        uart_puts("\n[TEST 15/16] AllOps-Mini INT8 (18 layers)\n");
+        test_case_t tc = { BLOB_ALLOPS_INT8_BASE, "AllOps-Mini INT8", 0 };
+        int ret = run_test_case(&tc);
+        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
+        else if (ret > 0) {
+            uart_puts("  FAIL — ");
+            uart_put_dec(ret);
+            uart_puts(" mismatches\n");
+            global_err++;
+        }
+        else {
+            uart_puts("  AllOps-Mini INT8: ALL ");
+            uart_put_dec(tc.num_layers);
+            uart_puts(" LAYERS PASSED ✓\n");
+        }
+    }
+
+    {
+        uart_puts("\n[TEST 16/16] AllOps-Mini INT16 (18 layers)\n");
+        test_case_t tc = { BLOB_ALLOPS_INT16_BASE, "AllOps-Mini INT16", 0 };
+        int ret = run_test_case(&tc);
+        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
+        else if (ret > 0) {
+            uart_puts("  FAIL — ");
+            uart_put_dec(ret);
+            uart_puts(" mismatches\n");
+            global_err++;
+        }
+        else {
+            uart_puts("  AllOps-Mini INT16: ALL ");
+            uart_put_dec(tc.num_layers);
+            uart_puts(" LAYERS PASSED ✓\n");
+        }
     }
 
     /* ── Final result ── */
