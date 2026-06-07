@@ -325,6 +325,9 @@ static int run_test_case(test_case_t *tc) {
             payload += n_input;
         }
 
+        /* Flush DCache so DMA sees CPU writes to workspace buffers */
+        dcache_flush();
+
         /* Program CSRs */
         npu_program_layer(hdr, n_input);
 
@@ -409,6 +412,8 @@ static int run_test_case(test_case_t *tc) {
             for (uint32_t i = 0; i < next_n_input; i++) {
                 ((volatile uint32_t *)NPU_INPUT_BASE)[i] = out_ptr[i];
             }
+            /* Flush so next layer's DMA sees the copied input */
+            dcache_flush();
         }
 
         /* Move data pointer to next entry */
