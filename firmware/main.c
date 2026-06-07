@@ -308,10 +308,8 @@ static int run_test_case(test_case_t *tc) {
         memcpy_32(NPU_PARAM_BASE, payload, n_param);
         payload += n_param;
 
-        /* Copy input to NPU INPUT workspace (first layer only) */
-        if (l == 0) {
-            memcpy_32(NPU_INPUT_BASE, payload, n_input);
-        }
+        /* Copy input to NPU INPUT workspace (from blob) */
+        memcpy_32(NPU_INPUT_BASE, payload, n_input);
         payload += n_input;
 
         /* Golden output reference */
@@ -399,21 +397,6 @@ static int run_test_case(test_case_t *tc) {
             uart_put_dec(layer_err);
             uart_puts(" mismatches\n");
             total_err += layer_err;
-        }
-
-        /* Prepare for next layer: copy output to input */
-        if (l + 1 < num_layers) {
-            uint32_t hdr_words = LAYER_ENTRY_HDR_SIZE / 4;
-            uint32_t extra = (op_type == 4) ? n_input : 0;  /* Add has input_b */
-            uint32_t next_hdr_off = hdr_words + n_wgt + n_param + n_input + n_output + extra;
-            const uint32_t *next_hdr = data_ptr + next_hdr_off;
-            uint32_t next_n_input = next_hdr[2];
-            /* Copy output as input for next layer */
-            for (uint32_t i = 0; i < next_n_input; i++) {
-                ((volatile uint32_t *)NPU_INPUT_BASE)[i] = out_ptr[i];
-            }
-            /* Flush so next layer's DMA sees the copied input */
-            dcache_flush();
         }
 
         /* Move data pointer to next entry */
