@@ -297,6 +297,12 @@ def generate_resize_test_data():
                                 resize_mode=1, int16_mode=True, seed=121)
     _add('resize_bilinear_int16', meta, raw)
 
+    # Test 2: Nearest resize INT16 (4x4x4 -> 8x8x4)
+    meta, raw = gen_resize_test(in_h=4, in_w=4, in_c=4,
+                                out_h=8, out_w=8,
+                                resize_mode=0, int16_mode=True, seed=122)
+    _add('resize_nearest_int16', meta, raw)
+
     return tests
 
 
@@ -533,7 +539,7 @@ def generate():
         pool_base += (len(pool_blobs[name]) + 3) & ~3
 
     resize_addrs = {}
-    for name in ['resize_nearest_int8', 'resize_bilinear_int16']:
+    for name in ['resize_nearest_int8', 'resize_bilinear_int16', 'resize_nearest_int16']:
         resize_addrs[name] = pool_base
         print(f'{name} blob @ 0x{pool_base:08X}')
         pool_base += (len(resize_blobs[name]) + 3) & ~3
@@ -583,7 +589,7 @@ def generate():
         f.write(blob_int16)
         for name in ['pool_max_int8', 'pool_avg_int8', 'pool_global_int8', 'pool_max_int16', 'pool_avg_int16', 'pool_global_int16']:
             f.write(pool_blobs[name])
-        for name in ['resize_nearest_int8', 'resize_bilinear_int16']:
+        for name in ['resize_nearest_int8', 'resize_bilinear_int16', 'resize_nearest_int16']:
             f.write(resize_blobs[name])
         for name in ['deconv_int8', 'deconv_int16']:
             f.write(deconv_blobs[name])
