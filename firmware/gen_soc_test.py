@@ -26,19 +26,19 @@ import struct
 import sys
 import numpy as np
 
-# Add rtl/tb to path for golden generator imports
+# Add rtl/tb/golden to path for golden generator imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SOC_DIR = os.path.dirname(SCRIPT_DIR)
 PROJECT_ROOT = os.path.dirname(SOC_DIR)
-sys.path.insert(0, os.path.join(PROJECT_ROOT, 'rtl', 'tb'))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden'))
 from gen_dma_e2e_golden import gen_pooling_test, gen_resize_test, gen_deconv_test, gen_concat_test, gen_add_test, gen_dwconv_test, gen_conv2d_test, gen_fc_test
 
-rtl_tb_dir = os.path.join(PROJECT_ROOT, 'rtl', 'tb')
-sys.path.insert(0, rtl_tb_dir)
+rtl_tb_golden_dir = os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden')
+sys.path.insert(0, rtl_tb_golden_dir)
 from gen_full_model_golden import build_allops_mini
 
 # ── Paths ──
-GOLDEN_DIR = os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden_dma_e2e')
+GOLDEN_DIR = os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden', 'golden_dma_e2e')
 
 OUTPUT_DIR = SCRIPT_DIR
 BLOB_FILE = os.path.join(OUTPUT_DIR, 'test_data.bin')
