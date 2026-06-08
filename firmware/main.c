@@ -18,7 +18,7 @@
  * ═══════════════════════════════════════════════════════════════════ */
 #define MAIN_RAM_BASE   0x40000000UL
 #define NPU_BASE_ADDR   0x80000000UL
-#define NPU_ADD_B_BASE  0x40030000UL  /* Add Branch B input workspace */
+#define NPU_ADD_B_BASE  0x40038000UL  /* Add Branch B input workspace */
 
 /* UART (LiteX CSR UART) */
 #define UART_RXTX       (*(volatile uint32_t *)0xF0001800UL)
@@ -213,6 +213,16 @@ static void npu_program_layer(const uint32_t *entry_hdr, uint32_t n_input_words)
             NPU_REG(REG_DECONV_CFG) = cfg_aux;
         } else if (op_type == 7) {
             NPU_REG(REG_CONCAT_CFG) = cfg_aux;
+            /* Concat: both branches must use same out_base >= any branch input.
+             * Use out_base = max(n_input_words, dma_out_words) so that:
+             * 1) Input load never overlaps output region
+             * 2) Both Branch A and B compute the same out_base */
+            {
+                uint32_t dma_out_words = dma_out_sz / 4;
+                uint32_t safe_out_base = (dma_out_words > n_input_words)
+                                         ? dma_out_words : n_input_words;
+                NPU_REG(REG_SRAM_BASE) = safe_out_base << 16;
+            }
         } else if (op_type == 4) {
             NPU_REG(REG_DMA_ADD_B_ADDR) = NPU_ADD_B_BASE;
             param_cnt = 1;  /* Add uses 1 rescale param set, not per-channel */
@@ -222,8 +232,11 @@ static void npu_program_layer(const uint32_t *entry_hdr, uint32_t n_input_words)
     NPU_REG(REG_TILE_CFG)   = 0;
     NPU_REG(REG_TILE_COUNT) = 1 | (1 << 16);
 
-    /* SRAM base: act_base=0, out_base = n_input_words (output after input) */
-    NPU_REG(REG_SRAM_BASE) = n_input_words << 16;
+    /* SRAM base: act_base=0, out_base = n_input_words (output after input)
+     * Exception: Concat sets SRAM_BASE above for shared out_base */
+    if (op_type != 7) {
+        NPU_REG(REG_SRAM_BASE) = n_input_words << 16;
+    }
 
     /* DMA addresses */
     NPU_REG(REG_DMA_WGT_ADDR)   = NPU_WGT_BASE;
