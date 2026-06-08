@@ -49,10 +49,10 @@ MAIN_RAM_BASE = 0x40000000
 BLOB_INT8_BASE = 0x40002000   # 8KB into main RAM (past firmware)
 # INT16_BASE will be computed based on actual INT8 blob size
 BLOB_INT16_BASE = None  # computed below
-NPU_WGT_BASE = 0x40020000
-NPU_PARAM_BASE = 0x40024000
-NPU_INPUT_BASE = 0x40028000
-NPU_OUTPUT_BASE = 0x4002C000
+NPU_WGT_BASE = 0x40028000
+NPU_PARAM_BASE = 0x4002C000
+NPU_INPUT_BASE = 0x40030000
+NPU_OUTPUT_BASE = 0x40034000
 
 # ── Binary blob format ──
 MAGIC = 0x4E505532  # "NPU2"
@@ -346,10 +346,15 @@ def convert_allops_invocations(invocations):
         if op == 4 and 'input_b_words' in data:
             converted['input_b'] = np.array(data['input_b_words'], dtype=np.uint32)
 
-        # Compute DMA sizes (not present in invocation meta)
+        # Compute DMA sizes
         meta['dma_in_size'] = len(converted['input']) * 4
         meta['dma_wgt_size'] = len(converted['wgt']) * 4
-        meta['dma_out_size'] = len(converted['output']) * 4
+
+        # Concat: use dma_out_size_override (both branches DMA the full combined output)
+        if op == 7 and 'dma_out_size_override' in inv['meta']:
+            meta['dma_out_size'] = inv['meta']['dma_out_size_override']
+        else:
+            meta['dma_out_size'] = len(converted['output']) * 4
 
         metas.append(meta)
         datas.append(converted)
