@@ -252,6 +252,20 @@ def generate_pooling_test_data():
                                  global_pool=False, int16_mode=True, seed=45)
     _add('pool_max_int16', meta, raw)
 
+    # Test 4: AvgPool 2x2 stride 2, INT16 (4x4x8 -> 2x2x8)
+    meta, raw = gen_pooling_test(mode='avg', pool_h=2, pool_w=2,
+                                 pool_sh=2, pool_sw=2,
+                                 in_h=4, in_w=4, in_c=8,
+                                 global_pool=False, int16_mode=True, seed=46)
+    _add('pool_avg_int16', meta, raw)
+
+    # Test 5: Global AvgPool, INT16 (4x4x4 -> 1x1x4)
+    meta, raw = gen_pooling_test(mode='avg', pool_h=4, pool_w=4,
+                                 pool_sh=4, pool_sw=4,
+                                 in_h=4, in_w=4, in_c=4,
+                                 global_pool=True, int16_mode=True, seed=47)
+    _add('pool_global_int16', meta, raw)
+
     return tests
 
 
@@ -513,7 +527,7 @@ def generate():
     blob_int16_aligned = (len(blob_int16) + 3) & ~3
     pool_base = BLOB_INT16_BASE + blob_int16_aligned
     pool_addrs = {}
-    for name in ['pool_max_int8', 'pool_avg_int8', 'pool_global_int8', 'pool_max_int16']:
+    for name in ['pool_max_int8', 'pool_avg_int8', 'pool_global_int8', 'pool_max_int16', 'pool_avg_int16', 'pool_global_int16']:
         pool_addrs[name] = pool_base
         print(f'{name} blob @ 0x{pool_base:08X}')
         pool_base += (len(pool_blobs[name]) + 3) & ~3
@@ -567,7 +581,7 @@ def generate():
     with open(BLOB_FILE, 'wb') as f:
         f.write(blob_int8)
         f.write(blob_int16)
-        for name in ['pool_max_int8', 'pool_avg_int8', 'pool_global_int8', 'pool_max_int16']:
+        for name in ['pool_max_int8', 'pool_avg_int8', 'pool_global_int8', 'pool_max_int16', 'pool_avg_int16', 'pool_global_int16']:
             f.write(pool_blobs[name])
         for name in ['resize_nearest_int8', 'resize_bilinear_int16']:
             f.write(resize_blobs[name])
