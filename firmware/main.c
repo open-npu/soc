@@ -18,7 +18,7 @@
  * ═══════════════════════════════════════════════════════════════════ */
 #define MAIN_RAM_BASE   0x40000000UL
 #define NPU_BASE_ADDR   0x80000000UL
-#define NPU_ADD_B_BASE  0x40038000UL  /* Add Branch B input workspace */
+#define NPU_ADD_B_BASE  0x4003C000UL  /* Add Branch B input workspace */
 
 /* UART (LiteX CSR UART) */
 #define UART_RXTX       (*(volatile uint32_t *)0xF0001800UL)
@@ -448,7 +448,7 @@ void main(void) {
     int global_err = 0;
 
     /* ── Test 1: INT8 MobileNetV2-Tiny ── */
-    uart_puts("\n[TEST 1/16] INT8 MobileNetV2-Tiny (10 layers)\n");
+    uart_puts("\n[TEST 1/18] INT8 MobileNetV2-Tiny (10 layers)\n");
     test_case_t tc_int8 = { BLOB_INT8_BASE, "INT8", 0 };
     int ret_int8 = run_test_case(&tc_int8);
     if (ret_int8 < 0) {
@@ -466,7 +466,7 @@ void main(void) {
     }
 
     /* ── Test 2: INT16 MobileNetV2-Tiny ── */
-    uart_puts("\n[TEST 2/16] INT16 MobileNetV2-Tiny (10 layers)\n");
+    uart_puts("\n[TEST 2/18] INT16 MobileNetV2-Tiny (10 layers)\n");
     test_case_t tc_int16 = { BLOB_INT16_BASE, "INT16", 0 };
     int ret_int16 = run_test_case(&tc_int16);
     if (ret_int16 < 0) {
@@ -485,7 +485,7 @@ void main(void) {
 
     /* ── Pooling operator tests ── */
     {
-        uart_puts("\n[TEST 3/16] Pool Max INT8\n");
+        uart_puts("\n[TEST 3/18] Pool Max INT8\n");
         test_case_t tc = { BLOB_POOL_MAX_INT8_BASE, "Pool Max INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -494,7 +494,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 4/16] Pool Avg INT8\n");
+        uart_puts("\n[TEST 4/18] Pool Avg INT8\n");
         test_case_t tc = { BLOB_POOL_AVG_INT8_BASE, "Pool Avg INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -503,7 +503,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 5/16] Pool Global INT8\n");
+        uart_puts("\n[TEST 5/18] Pool Global INT8\n");
         test_case_t tc = { BLOB_POOL_GLOBAL_INT8_BASE, "Pool Global INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -512,7 +512,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 6/16] Pool Max INT16\n");
+        uart_puts("\n[TEST 6/18] Pool Max INT16\n");
         test_case_t tc = { BLOB_POOL_MAX_INT16_BASE, "Pool Max INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -522,7 +522,7 @@ void main(void) {
 
     /* ── Resize operator tests ── */
     {
-        uart_puts("\n[TEST 7/16] Resize Nearest INT8\n");
+        uart_puts("\n[TEST 7/18] Resize Nearest INT8\n");
         test_case_t tc = { BLOB_RESIZE_NEAREST_INT8_BASE, "Resize Nearest INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -531,7 +531,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 8/16] Resize Bilinear INT16\n");
+        uart_puts("\n[TEST 8/18] Resize Bilinear INT16\n");
         test_case_t tc = { BLOB_RESIZE_BILINEAR_INT16_BASE, "Resize Bilinear INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -541,7 +541,7 @@ void main(void) {
 
     /* ── Deconv operator tests ── */
     {
-        uart_puts("\n[TEST 9/16] Deconv INT8\n");
+        uart_puts("\n[TEST 9/18] Deconv INT8\n");
         test_case_t tc = { BLOB_DECONV_INT8_BASE, "Deconv INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -550,7 +550,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 10/16] Deconv INT16\n");
+        uart_puts("\n[TEST 10/18] Deconv INT16\n");
         test_case_t tc = { BLOB_DECONV_INT16_BASE, "Deconv INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -560,7 +560,7 @@ void main(void) {
 
     /* ── Concat operator tests ── */
     {
-        uart_puts("\n[TEST 11/16] Concat INT8\n");
+        uart_puts("\n[TEST 11/18] Concat INT8\n");
         test_case_t tc = { BLOB_CONCAT_INT8_BASE, "Concat INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -569,7 +569,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 12/16] Concat INT16\n");
+        uart_puts("\n[TEST 12/18] Concat INT16\n");
         test_case_t tc = { BLOB_CONCAT_INT16_BASE, "Concat INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -579,7 +579,7 @@ void main(void) {
 
     /* ── Add operator tests ── */
     {
-        uart_puts("\n[TEST 13/16] Eltwise Add INT8\n");
+        uart_puts("\n[TEST 13/18] Eltwise Add INT8\n");
         test_case_t tc = { BLOB_ADD_INT8_BASE, "Add INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -588,8 +588,27 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 14/16] Eltwise Add INT16\n");
+        uart_puts("\n[TEST 14/18] Eltwise Add INT16\n");
         test_case_t tc = { BLOB_ADD_INT16_BASE, "Add INT16", 0 };
+        int ret = run_test_case(&tc);
+        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
+        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
+        else { uart_puts("  PASS ✓\n"); }
+    }
+
+    /* ── DWConv operator tests ── */
+    {
+        uart_puts("\n[TEST 15/18] DWConv INT8 (8x8x8 stride-1)\n");
+        test_case_t tc = { BLOB_DWCONV_INT8_BASE, "DWConv INT8", 0 };
+        int ret = run_test_case(&tc);
+        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
+        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
+        else { uart_puts("  PASS ✓\n"); }
+    }
+
+    {
+        uart_puts("\n[TEST 16/18] DWConv INT16 (8x8x8 stride-2)\n");
+        test_case_t tc = { BLOB_DWCONV_INT16_BASE, "DWConv INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
         else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
@@ -598,7 +617,7 @@ void main(void) {
 
     /* ── AllOps-Mini full model (18 layers, all 7 operators) ── */
     {
-        uart_puts("\n[TEST 15/16] AllOps-Mini INT8 (18 layers)\n");
+        uart_puts("\n[TEST 17/18] AllOps-Mini INT8 (18 layers)\n");
         test_case_t tc = { BLOB_ALLOPS_INT8_BASE, "AllOps-Mini INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -616,7 +635,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 16/16] AllOps-Mini INT16 (18 layers)\n");
+        uart_puts("\n[TEST 18/18] AllOps-Mini INT16 (18 layers)\n");
         test_case_t tc = { BLOB_ALLOPS_INT16_BASE, "AllOps-Mini INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
