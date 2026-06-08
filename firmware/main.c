@@ -568,7 +568,7 @@ void main(void) {
 
     /* ── Deconv operator tests ── */
     {
-        uart_puts("\n[TEST 11/23] Deconv INT8\n");
+        uart_puts("\n[TEST 12/23] Deconv INT8\n");
         test_case_t tc = { BLOB_DECONV_INT8_BASE, "Deconv INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -577,7 +577,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 12/23] Deconv INT16\n");
+        uart_puts("\n[TEST 13/23] Deconv INT16\n");
         test_case_t tc = { BLOB_DECONV_INT16_BASE, "Deconv INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -587,7 +587,7 @@ void main(void) {
 
     /* ── Concat operator tests ── */
     {
-        uart_puts("\n[TEST 13/23] Concat INT8\n");
+        uart_puts("\n[TEST 14/23] Concat INT8\n");
         test_case_t tc = { BLOB_CONCAT_INT8_BASE, "Concat INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -596,7 +596,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 14/23] Concat INT16\n");
+        uart_puts("\n[TEST 15/23] Concat INT16\n");
         test_case_t tc = { BLOB_CONCAT_INT16_BASE, "Concat INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -606,7 +606,7 @@ void main(void) {
 
     /* ── Add operator tests ── */
     {
-        uart_puts("\n[TEST 15/23] Eltwise Add INT8\n");
+        uart_puts("\n[TEST 16/23] Eltwise Add INT8\n");
         test_case_t tc = { BLOB_ADD_INT8_BASE, "Add INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -615,7 +615,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 16/23] Eltwise Add INT16\n");
+        uart_puts("\n[TEST 17/23] Eltwise Add INT16\n");
         test_case_t tc = { BLOB_ADD_INT16_BASE, "Add INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -625,7 +625,7 @@ void main(void) {
 
     /* ── DWConv operator tests ── */
     {
-        uart_puts("\n[TEST 17/23] DWConv INT8 (8x8x8 stride-1)\n");
+        uart_puts("\n[TEST 18/23] DWConv INT8 (8x8x8 stride-1)\n");
         test_case_t tc = { BLOB_DWCONV_INT8_BASE, "DWConv INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -634,7 +634,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 18/23] DWConv INT16 (8x8x8 stride-2)\n");
+        uart_puts("\n[TEST 19/23] DWConv INT16 (8x8x8 stride-2)\n");
         test_case_t tc = { BLOB_DWCONV_INT16_BASE, "DWConv INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -644,7 +644,7 @@ void main(void) {
 
     /* ── FC operator tests ── */
     {
-        uart_puts("\n[TEST 19/23] FC INT8 (1x1x8 -> 1x1x4)\n");
+        uart_puts("\n[TEST 20/23] FC INT8 (1x1x8 -> 1x1x4)\n");
         test_case_t tc = { BLOB_FC_INT8_BASE, "FC INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -653,7 +653,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 20/23] FC INT16 (1x1x8 -> 1x1x4)\n");
+        uart_puts("\n[TEST 21/23] FC INT16 (1x1x8 -> 1x1x4)\n");
         test_case_t tc = { BLOB_FC_INT16_BASE, "FC INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -663,7 +663,7 @@ void main(void) {
 
     /* ── AllOps-Mini full model (18 layers, all 7 operators) ── */
     {
-        uart_puts("\n[TEST 21/23] AllOps-Mini INT8 (18 layers)\n");
+        uart_puts("\n[TEST 22/23] AllOps-Mini INT8 (18 layers)\n");
         test_case_t tc = { BLOB_ALLOPS_INT8_BASE, "AllOps-Mini INT8", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
@@ -681,7 +681,7 @@ void main(void) {
     }
 
     {
-        uart_puts("\n[TEST 22/23] AllOps-Mini INT16 (18 layers)\n");
+        uart_puts("\n[TEST 23/23] AllOps-Mini INT16 (18 layers)\n");
         test_case_t tc = { BLOB_ALLOPS_INT16_BASE, "AllOps-Mini INT16", 0 };
         int ret = run_test_case(&tc);
         if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
