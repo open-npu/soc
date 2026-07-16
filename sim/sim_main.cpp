@@ -6,8 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 
-#define MAX_SIM_TIME 100000000  // 100M cycles (~2s @ 50MHz)
-#define UART_TIMEOUT  30000000  // Stop if no UART activity for this long
+#define MAX_SIM_TIME 500000000  // 500M cycles (~10s @ 50MHz)
+#define UART_TIMEOUT  200000000  // Stop if no UART activity for 200M cycles
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
