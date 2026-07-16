@@ -26,7 +26,8 @@ VERILATOR_FLAGS = --cc --exe -O3 \
     -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL \
     -Wno-UNOPTFLAT -Wno-COMBDLY -Wno-LATCH -Wno-CASEINCOMPLETE \
     --top-module $(VERILOG_TOP) \
-    -I$(NPU_INC_DIR)
+    -I$(NPU_INC_DIR) \
+    +define+SYNTHESIS
 
 .PHONY: all build run clean generate
 

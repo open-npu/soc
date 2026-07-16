@@ -3,71 +3,58 @@
 #define SOC_TEST_DATA_H
 #include <stdint.h>
 
-/* Blob base addresses in main RAM */
-#define BLOB_INT8_BASE  0x40002000
-#define BLOB_INT16_BASE 0x4000652C
-#define BLOB_POOL_MAX_INT8_BASE  0x4000DF40
-#define BLOB_POOL_AVG_INT8_BASE  0x4000E0B8
-#define BLOB_POOL_GLOBAL_INT8_BASE  0x4000E230
-#define BLOB_POOL_MAX_INT16_BASE  0x4000E30C
-#define BLOB_POOL_AVG_INT16_BASE  0x4000E524
-#define BLOB_POOL_GLOBAL_INT16_BASE  0x4000E73C
-#define BLOB_RESIZE_NEAREST_INT8_BASE  0x4000E85C
-#define BLOB_RESIZE_BILINEAR_INT16_BASE  0x4000EA34
-#define BLOB_RESIZE_NEAREST_INT16_BASE  0x4000ED4C
-#define BLOB_DECONV_INT8_BASE  0x4000F064
-#define BLOB_DECONV_INT16_BASE  0x4000F27C
-#define BLOB_CONCAT_INT8_BASE  0x4000F63C
-#define BLOB_CONCAT_INT16_BASE  0x4000F718
-#define BLOB_ADD_INT8_BASE  0x4000F874
-#define BLOB_ADD_INT16_BASE  0x4000FA54
-#define BLOB_DWCONV_INT8_BASE  0x4000FDB4
-#define BLOB_DWCONV_INT16_BASE  0x400102D4
-#define BLOB_FC_INT8_BASE  0x4001093C
-#define BLOB_FC_INT16_BASE  0x40010A00
-#define BLOB_CONV2D_INT8_BASE  0x40010AF0
-#define BLOB_CONV2D_INT16_BASE  0x40010FA8
-#define BLOB_ALLOPS_INT8_BASE  0x40011700
-#define BLOB_ALLOPS_INT16_BASE  0x4001A0DC
+/* Model: model_b_int16 */
+#define BLOB_MODEL_BASE  0x40010000
+#define BLOB_MODEL_SIZE  1513108
 
-/* NPU DMA workspace addresses in main RAM */
-#define NPU_WGT_BASE     0x4002C000
-#define NPU_PARAM_BASE   0x40030000
-#define NPU_INPUT_BASE   0x40034000
-#define NPU_OUTPUT_BASE  0x40038000
-
-/* Per-layer blob entry header layout (16 uint32 words per layer) */
+/* Per-layer blob entry header (36 uint32 words = 144 bytes) */
 typedef struct {
-    uint32_t n_wgt;          /* [0]  weight word count */
-    uint32_t n_param;        /* [1]  param word count */
-    uint32_t n_input;        /* [2]  input word count */
-    uint32_t n_output;       /* [3]  output word count */
-    uint32_t op_type;        /* [4]  operator type */
-    uint32_t data_type;      /* [5]  INT8=0, INT16=1 */
-    uint32_t in_hw;          /* [6]  in_h | (in_w << 16) */
-    uint32_t in_c;           /* [7]  input channels */
-    uint32_t out_hw;         /* [8]  out_h | (out_w << 16) */
-    uint32_t out_c;          /* [9]  output channels */
-    uint32_t kernel_dil;     /* [10] kh | (kw<<8) | (dh<<16) | (dw<<24) */
-    uint32_t stride;         /* [11] sh | (sw << 8) */
-    uint32_t padding;        /* [12] top | (bot<<8) | (left<<16) | (right<<24) */
-    uint32_t post_ctrl;      /* [13] PPU post-processing control */
-    uint32_t param_count;    /* [14] per-channel param count */
-    uint32_t dma_in_size;    /* [15] DMA input transfer size (bytes) */
-    uint32_t dma_wgt_size;   /* [16] DMA weight transfer size (bytes) */
-    uint32_t dma_out_size;   /* [17] DMA output transfer size (bytes) */
-    uint32_t cfg_aux;        /* [18] operator-specific config (pool_cfg etc) */
-    /* Data follows: wgt[n_wgt*4], param[n_param*4], input[n_input*4], output[n_output*4] */
+    uint32_t n_wgt;            /* [0]  */
+    uint32_t n_param;          /* [1]  */
+    uint32_t n_input;          /* [2]  */
+    uint32_t n_output;         /* [3]  */
+    uint32_t op_type;          /* [4]  */
+    uint32_t data_type;        /* [5]  */
+    uint32_t in_hw;            /* [6]  */
+    uint32_t in_c;             /* [7]  */
+    uint32_t out_hw;           /* [8]  */
+    uint32_t out_c;            /* [9]  */
+    uint32_t kernel_dil;       /* [10] */
+    uint32_t stride;           /* [11] */
+    uint32_t padding;          /* [12] */
+    uint32_t post_ctrl;        /* [13] */
+    uint32_t param_count;      /* [14] */
+    uint32_t dma_in_size;      /* [15] */
+    uint32_t dma_wgt_size;     /* [16] */
+    uint32_t dma_out_size;     /* [17] */
+    uint32_t cfg_aux;          /* [18] */
+    uint32_t tile_cfg;         /* [19] */
+    uint32_t tile_count;       /* [20] */
+    uint32_t sched_ctrl;       /* [21] */
+    uint32_t store_mode;       /* [22] */
+    uint32_t tile_in_size;     /* [23] */
+    uint32_t tile_out_size;    /* [24] */
+    uint32_t row_cfg;          /* [25] */
+    uint32_t wgt_per_oc_words; /* [26] */
+    uint32_t clamp_max;        /* [27] */
+    uint32_t in_zp;            /* [28] */
+    uint32_t ddr_wgt_addr;     /* [29] */
+    uint32_t ddr_param_addr;   /* [30] */
+    uint32_t ddr_out_addr;     /* [31] */
+    uint32_t ddr_in_addr;      /* [32] */
+    uint32_t ddr_add_b_addr;   /* [33] */
+    int32_t  input_src;        /* [34] -1=chain, N=skip */
+    int32_t  residual_src;     /* [35] -1=none, N=branch B */
 } __attribute__((packed)) layer_entry_t;
 
-#define LAYER_ENTRY_HDR_SIZE  76
+#define LAYER_ENTRY_HDR_SIZE  144
+#define LAYER_ENTRY_HDR_WORDS 36
 
-/* Blob header offsets */
-#define BLOB_OFF_MAGIC      0
-#define BLOB_OFF_LAYERS    4
-#define BLOB_OFF_VERSION   8
-#define BLOB_OFF_DATA      12  /* first layer entry starts here */
-
+/* Blob header */
 #define BLOB_MAGIC 0x4E505532
+#define BLOB_OFF_MAGIC   0
+#define BLOB_OFF_LAYERS  4
+#define BLOB_OFF_VERSION 8
+#define BLOB_OFF_DATA    12
 
 #endif /* SOC_TEST_DATA_H */

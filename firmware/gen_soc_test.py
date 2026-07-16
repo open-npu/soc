@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Generate SoC firmware test data from DMA E2E golden data.
+Generate SoC firmware test data for chained model inference.
 
-Reads golden .npy files and metadata.json for both INT8 and INT16
-MobileNetV2-Tiny models, produces:
-  - test_data.hex     — Verilog hex init for main RAM ($readmemh)
-  - soc_test_data.h   — C header with blob format and layer offsets
-  - soc_test_main.c   — Generated firmware main() replacement (optional)
+Reads golden .npy files and metadata.json for model_a/b/c/d INT16,
+produces:
+  - test_data.bin     — binary blob with 36-word layer_entry_t headers
+  - soc_test_data.h   — C header with blob format and model base address
 
-Memory layout in main RAM (0x40000000):
-  0x40000000 — blob header + configs
-  0x40000100 — INT8 test data
-  0x40010000 — INT16 test data
-  0x40020000 — NPU WGT workspace (reused per layer)
-  0x40024000 — NPU PARAM workspace
-  0x40028000 — NPU INPUT workspace
-  0x4002C000 — NPU OUTPUT workspace
+Chained inference: Layer N output in DDR becomes Layer N+1 input.
+Only layer 0 has inline input data; all layers have golden output for verification.
+
+Usage:
+  python3 gen_soc_test.py --model model_b_int16
+  python3 gen_soc_test.py --model model_d_int16
 
 SPDX-License-Identifier: Apache-2.0
 """
@@ -24,20 +21,13 @@ import json
 import os
 import struct
 import sys
+import argparse
 import numpy as np
 
-# Add rtl/tb/golden to path for golden generator imports
+# ── Paths ──
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SOC_DIR = os.path.dirname(SCRIPT_DIR)
 PROJECT_ROOT = os.path.dirname(SOC_DIR)
-sys.path.insert(0, os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden'))
-from gen_dma_e2e_golden import gen_pooling_test, gen_resize_test, gen_deconv_test, gen_concat_test, gen_add_test, gen_dwconv_test, gen_conv2d_test, gen_fc_test
-
-rtl_tb_golden_dir = os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden')
-sys.path.insert(0, rtl_tb_golden_dir)
-from gen_full_model_golden import build_allops_mini
-
-# ── Paths ──
 GOLDEN_DIR = os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden', 'golden_dma_e2e')
 
 OUTPUT_DIR = SCRIPT_DIR
@@ -46,19 +36,14 @@ HEADER_FILE = os.path.join(OUTPUT_DIR, 'soc_test_data.h')
 
 # ── Memory map ──
 MAIN_RAM_BASE = 0x40000000
-BLOB_INT8_BASE = 0x40002000   # 8KB into main RAM (past firmware)
-# INT16_BASE will be computed based on actual INT8 blob size
-BLOB_INT16_BASE = None  # computed below
-NPU_WGT_BASE = 0x4002C000
-NPU_PARAM_BASE = 0x40030000
-NPU_INPUT_BASE = 0x40034000
-NPU_OUTPUT_BASE = 0x40038000
+BLOB_BASE = 0x40010000      # blob header + layer entries + inline data at 64KB offset
+MODEL_DDR_BASE = 0x40200000  # model DDR data (wgt/param/in/out) at 2MB offset
+DDR_REMAP_OFFSET = MODEL_DDR_BASE - 0x30000000  # metadata 0x30000000 → 0x40200000
 
 # ── Binary blob format ──
 MAGIC = 0x4E505532  # "NPU2"
-
-# Per-layer blob entry size (19 uint32_t header words per layer)
-LAYER_ENTRY_HDR_WORDS = 19
+LAYER_ENTRY_HDR_WORDS = 36
+LAYER_ENTRY_HDR_SIZE = LAYER_ENTRY_HDR_WORDS * 4  # 144 bytes
 
 
 def pack_u32(v):
@@ -66,708 +51,264 @@ def pack_u32(v):
     return struct.pack('<I', v & 0xFFFFFFFF)
 
 
-def load_golden(mode):
-    """Load golden data from .npy files."""
-    d = os.path.join(GOLDEN_DIR, mode)
-    meta = json.load(open(os.path.join(d, 'metadata.json')))
+def load_model_golden(model_name):
+    """Load model INT16 golden data from .npy files."""
+    d = os.path.join(GOLDEN_DIR, model_name)
+    with open(os.path.join(d, 'metadata.json')) as f:
+        meta = json.load(f)
     data = []
     for i in range(len(meta)):
         prefix = f'layer_{i:02d}'
-        data.append({
+        entry = {
             'wgt': np.load(os.path.join(d, f'{prefix}_wgt.npy')),
             'param': np.load(os.path.join(d, f'{prefix}_param.npy')),
             'input': np.load(os.path.join(d, f'{prefix}_input.npy')),
             'output': np.load(os.path.join(d, f'{prefix}_output.npy')),
-        })
+        }
+        # Check for input_b (Add layers)
+        input_b_path = os.path.join(d, f'{prefix}_input_b.npy')
+        if os.path.exists(input_b_path):
+            entry['input_b'] = np.load(input_b_path)
+        data.append(entry)
     return meta, data
 
 
-def build_blob(meta, layer_data):
-    """Build binary blob bytes for one test case."""
+def remap_ddr(addr):
+    """Remap metadata DDR address (0x30XXXXXX) to SoC main RAM (0x40100000+)."""
+    if addr == 0:
+        return 0
+    return (addr & 0x0FFFFFFF) + MODEL_DDR_BASE
+
+
+def build_chained_blob(meta, data):
+    """Build binary blob bytes for chained model inference.
+
+    Each layer has 36-word header + wgt + param + input(L0 only) + golden output.
+    DDR addresses are remapped from 0x30XXXXXX to 0x40XXXXXX.
+    """
     buf = bytearray()
     buf += pack_u32(MAGIC)
     buf += pack_u32(len(meta))
     buf += pack_u32(1)  # version
 
-    for i, m in enumerate(meta):
-        d = layer_data[i]
-        wgt_words = np.asarray(d['wgt'], dtype=np.uint32)
-        param_words = np.asarray(d['param'], dtype=np.uint32)
-        input_words = np.asarray(d['input'], dtype=np.uint32)
-        output_words = np.asarray(d['output'], dtype=np.uint32)
+    for i, (m, d) in enumerate(zip(meta, data)):
+        # Build 36-word header
+        wgt = d['wgt']
+        param = d['param']
+        inp = d['input']
+        out = d['output']
 
-        # Entry header (16 words)
-        buf += pack_u32(len(wgt_words))
-        buf += pack_u32(len(param_words))
-        buf += pack_u32(len(input_words))
-        buf += pack_u32(len(output_words))
-        buf += pack_u32(m['op_type'])
-        buf += pack_u32(m['data_type'])
-        buf += pack_u32(m['in_h'] | (m['in_w'] << 16))
-        buf += pack_u32(m['in_c'])
-        buf += pack_u32(m['out_h'] | (m['out_w'] << 16))
-        buf += pack_u32(m['out_c'])
-        buf += pack_u32(m['kernel_h'] | (m['kernel_w'] << 8)
-                        | (m.get('dilation_h', 1) << 16) | (m.get('dilation_w', 1) << 24))
-        buf += pack_u32(m['stride_h'] | (m['stride_w'] << 8))
-        buf += pack_u32(m['pad_top'] | (m.get('pad_bottom', m['pad_top']) << 8)
-                        | (m['pad_left'] << 16) | (m.get('pad_right', m['pad_left']) << 24))
-        buf += pack_u32(m['post_ctrl'])
-        buf += pack_u32(m['dma_param_count'])
-        buf += pack_u32(m['dma_in_size'])
-        buf += pack_u32(m['dma_wgt_size'])
-        buf += pack_u32(m['dma_out_size'])
-        buf += pack_u32(m.get('pool_cfg', 0)      # word [18]: operator-specific
-                        | m.get('resize_cfg', 0)
-                        | m.get('deconv_cfg', 0)
-                        | m.get('concat_cfg', 0))
+        n_wgt = len(wgt)
+        n_param = len(param)
+        n_input = len(inp) if i == 0 else 0  # only layer 0 has inline input
+        n_output = len(out)
 
-        # Data payload
-        buf += wgt_words.tobytes()
-        buf += param_words.tobytes()
-        buf += input_words.tobytes()
-        buf += output_words.tobytes()
-        if 'input_b' in d:
-            buf += np.asarray(d['input_b'], dtype=np.uint32).tobytes()
+        # Remap DDR addresses
+        ddr_wgt = remap_ddr(m.get('ddr_wgt_addr', 0))
+        ddr_param = remap_ddr(m.get('ddr_param_addr', 0))
+        ddr_out = remap_ddr(m.get('ddr_out_addr', 0))
+        ddr_in = remap_ddr(m.get('ddr_in_addr', 0)) if i == 0 else 0
+        ddr_add_b = remap_ddr(m.get('ddr_add_b_addr', 0))
 
-    # Pad to 4-byte boundary
-    while len(buf) % 4 != 0:
-        buf.append(0)
+        # Pack fields
+        in_hw = m['in_h'] | (m['in_w'] << 16)
+        out_hw = m['out_h'] | (m['out_w'] << 16)
+        kernel_dil = m['kernel_h'] | (m['kernel_w'] << 8)
+        stride = m['stride_h'] | (m['stride_w'] << 8)
+        padding = m.get('pad_top', 0) | (m.get('pad_top', 0) << 8) | \
+                  (m.get('pad_left', 0) << 16) | (m.get('pad_left', 0) << 24)
+
+        tile_cfg = m.get('tile_h', 0) | (m.get('tile_w', 0) << 16)
+        tile_count = m.get('tile_num_h', 1) | (m.get('tile_num_w', 1) << 16)
+        sched_ctrl = m.get('sched_ctrl', 0)
+        store_mode = m.get('store_mode', 0)
+        tile_in_size = m.get('tile_in_size', 0)
+        tile_out_size = m.get('tile_out_size', 0)
+        row_cfg = m.get('row_cfg', 0)
+        wgt_per_oc = m.get('wgt_per_oc_words', 0)
+        clamp_max = m.get('clamp_max', 32767)
+        in_zp = m.get('in_zp', 0)
+        input_src = m.get('input_src', -1)
+        residual_src = m.get('residual_src', -1)
+
+        # cfg_aux: operator-specific config
+        cfg_aux = 0
+        if m['op_type'] == 3:  # Pool
+            cfg_aux = m.get('pool_cfg', 0)
+        elif m['op_type'] == 5:  # Resize
+            cfg_aux = m.get('resize_cfg', 0)
+        elif m['op_type'] == 6:  # Deconv
+            cfg_aux = m.get('deconv_cfg', 0)
+        elif m['op_type'] == 7:  # Concat
+            cfg_aux = m.get('concat_cfg', 0)
+
+        # Write 36-word header
+        hdr = [
+            n_wgt,              # [0]
+            n_param,            # [1]
+            n_input,            # [2]
+            n_output,           # [3]
+            m['op_type'],       # [4]
+            m.get('data_type', 1),  # [5]
+            in_hw,              # [6]
+            m['in_c'],          # [7]
+            out_hw,             # [8]
+            m['out_c'],         # [9]
+            kernel_dil,         # [10]
+            stride,             # [11]
+            padding,            # [12]
+            m.get('post_ctrl', 0),  # [13]
+            m.get('dma_param_count', 0),  # [14]
+            m.get('dma_in_size', 0),      # [15]
+            m.get('dma_wgt_size', 0),     # [16]
+            m.get('dma_out_size', 0),     # [17]
+            cfg_aux,            # [18]
+            tile_cfg,           # [19]
+            tile_count,         # [20]
+            sched_ctrl,         # [21]
+            store_mode,         # [22]
+            tile_in_size,       # [23]
+            tile_out_size,      # [24]
+            row_cfg,            # [25]
+            wgt_per_oc,         # [26]
+            clamp_max,          # [27]
+            in_zp,              # [28]
+            ddr_wgt,            # [29]
+            ddr_param,          # [30]
+            ddr_out,            # [31]
+            ddr_in,             # [32]
+            ddr_add_b,          # [33]
+            input_src & 0xFFFFFFFF,   # [34] -1 → 0xFFFFFFFF
+            residual_src & 0xFFFFFFFF,  # [35] -1 → 0xFFFFFFFF
+        ]
+        for w in hdr:
+            buf += pack_u32(w)
+
+        # Payload: wgt + param + input(L0 only) + golden output
+        for w in wgt:
+            buf += pack_u32(int(w))
+        for w in param:
+            buf += pack_u32(int(w))
+        if i == 0:
+            for w in inp:
+                buf += pack_u32(int(w))
+        for w in out:
+            buf += pack_u32(int(w))
 
     return bytes(buf)
 
 
-def bytes_to_hex_lines(data, words_per_line=1):
-    """Convert bytes to Verilog hex init format (one uint32 per line)."""
-    lines = []
-    for i in range(0, len(data), 4):
-        word = struct.unpack('<I', data[i:i+4])[0]
-        lines.append(f'{word:08X}')
-    return '\n'.join(lines)
-
-
-def generate_dwconv_test_data():
-    """Generate 2 DWConv test cases: INT8 stride-1, INT16 stride-2.
-
-    Returns list of (name, [meta], [data]) tuples, each a single-layer test.
-    """
-    tests = []
-
-    def _add(name, meta, raw_data):
-        data = {
-            'wgt': raw_data['wgt_words'],
-            'param': raw_data['param_words'],
-            'input': raw_data['input_words'],
-            'output': raw_data['output_words'],
-        }
-        tests.append((name, [meta], [data]))
-
-    # Test 0: DWConv 3x3 stride-1 pad-1, INT8 (8x8x8 -> 8x8x8)
-    meta, raw = gen_dwconv_test(in_h=8, in_w=8, in_c=8,
-                                kernel_h=3, kernel_w=3, stride=1, pad=1,
-                                relu6=True, int16_mode=False, seed=300)
-    _add('dwconv_int8', meta, raw)
-
-    # Test 1: DWConv 3x3 stride-2 pad-1, INT16 (8x8x8 -> 4x4x8)
-    meta, raw = gen_dwconv_test(in_h=8, in_w=8, in_c=8,
-                                kernel_h=3, kernel_w=3, stride=2, pad=1,
-                                relu6=True, int16_mode=True, seed=301)
-    _add('dwconv_int16', meta, raw)
-
-    return tests
-
-
-def generate_conv2d_test_data():
-    """Generate 2 Conv2D test cases: INT8 stride-1, INT16 stride-2.
-
-    Conv2D with arbitrary spatial dimensions, op_type=0.
-
-    Returns list of (name, [meta], [data]) tuples, each a single-layer test.
-    """
-    tests = []
-
-    def _add(name, meta, raw_data):
-        data = {
-            'wgt': raw_data['wgt_words'],
-            'param': raw_data['param_words'],
-            'input': raw_data['input_words'],
-            'output': raw_data['output_words'],
-        }
-        tests.append((name, [meta], [data]))
-
-    # Test 0: Conv2D 3x3 stride-1 pad-1, INT8 (8x8x8 -> 8x8x4)
-    meta, raw = gen_conv2d_test(in_h=8, in_w=8, in_c=8, out_c=4,
-                                kernel_h=3, kernel_w=3, stride=1, pad=1,
-                                relu6=True, int16_mode=False, seed=500)
-    _add('conv2d_int8', meta, raw)
-
-    # Test 1: Conv2D 3x3 stride-2 pad-1, INT16 (8x8x8 -> 4x4x4)
-    meta, raw = gen_conv2d_test(in_h=8, in_w=8, in_c=8, out_c=4,
-                                kernel_h=3, kernel_w=3, stride=2, pad=1,
-                                relu6=True, int16_mode=True, seed=501)
-    _add('conv2d_int16', meta, raw)
-
-    return tests
-
-
-def generate_fc_test_data():
-    """Generate 2 FC test cases: INT8, INT16.
-
-    FC is Conv1x1 with in_h=in_w=1, kernel=1x1, op_type=2.
-
-    Returns list of (name, [meta], [data]) tuples, each a single-layer test.
-    """
-    tests = []
-
-    def _add(name, meta, raw_data):
-        data = {
-            'wgt': raw_data['wgt_words'],
-            'param': raw_data['param_words'],
-            'input': raw_data['input_words'],
-            'output': raw_data['output_words'],
-        }
-        tests.append((name, [meta], [data]))
-
-    # Test 0: FC INT8 (1x1x8 -> 1x1x4)
-    meta, raw = gen_fc_test(in_c=8, out_c=4, relu6=True,
-                            int16_mode=False, seed=400)
-    _add('fc_int8', meta, raw)
-
-    # Test 1: FC INT16 (1x1x8 -> 1x1x4)
-    meta, raw = gen_fc_test(in_c=8, out_c=4, relu6=True,
-                            int16_mode=True, seed=401)
-    _add('fc_int16', meta, raw)
-
-    return tests
-
-
-def generate_pooling_test_data():
-    """Generate 4 Pooling test cases: Max INT8, Avg INT8, Global Avg INT8, Max INT16.
-
-    Returns list of (name, [meta], [data]) tuples, each a single-layer test.
-    """
-    tests = []
-
-    def _add(name, meta, raw_data):
-        data = {
-            'wgt': np.array([], dtype=np.uint32),
-            'param': raw_data['param_words'],
-            'input': raw_data['input_words'],
-            'output': raw_data['output_words'],
-        }
-        tests.append((name, [meta], [data]))
-
-    # Test 0: MaxPool 2x2 stride 2, INT8 (4x4x8 -> 2x2x8)
-    meta, raw = gen_pooling_test(mode='max', pool_h=2, pool_w=2,
-                                 pool_sh=2, pool_sw=2,
-                                 in_h=4, in_w=4, in_c=8,
-                                 global_pool=False, int16_mode=False, seed=42)
-    _add('pool_max_int8', meta, raw)
-
-    # Test 1: AvgPool 2x2 stride 2, INT8 (4x4x8 -> 2x2x8)
-    meta, raw = gen_pooling_test(mode='avg', pool_h=2, pool_w=2,
-                                 pool_sh=2, pool_sw=2,
-                                 in_h=4, in_w=4, in_c=8,
-                                 global_pool=False, int16_mode=False, seed=43)
-    _add('pool_avg_int8', meta, raw)
-
-    # Test 2: Global AvgPool, INT8 (4x4x4 -> 1x1x4)
-    meta, raw = gen_pooling_test(mode='avg', pool_h=4, pool_w=4,
-                                 pool_sh=4, pool_sw=4,
-                                 in_h=4, in_w=4, in_c=4,
-                                 global_pool=True, int16_mode=False, seed=44)
-    _add('pool_global_int8', meta, raw)
-
-    # Test 3: MaxPool 2x2 stride 2, INT16 (4x4x8 -> 2x2x8)
-    meta, raw = gen_pooling_test(mode='max', pool_h=2, pool_w=2,
-                                 pool_sh=2, pool_sw=2,
-                                 in_h=4, in_w=4, in_c=8,
-                                 global_pool=False, int16_mode=True, seed=45)
-    _add('pool_max_int16', meta, raw)
-
-    # Test 4: AvgPool 2x2 stride 2, INT16 (4x4x8 -> 2x2x8)
-    meta, raw = gen_pooling_test(mode='avg', pool_h=2, pool_w=2,
-                                 pool_sh=2, pool_sw=2,
-                                 in_h=4, in_w=4, in_c=8,
-                                 global_pool=False, int16_mode=True, seed=46)
-    _add('pool_avg_int16', meta, raw)
-
-    # Test 5: Global AvgPool, INT16 (4x4x4 -> 1x1x4)
-    meta, raw = gen_pooling_test(mode='avg', pool_h=4, pool_w=4,
-                                 pool_sh=4, pool_sw=4,
-                                 in_h=4, in_w=4, in_c=4,
-                                 global_pool=True, int16_mode=True, seed=47)
-    _add('pool_global_int16', meta, raw)
-
-    return tests
-
-
-def generate_resize_test_data():
-    """Generate 2 Resize test cases: nearest INT8, bilinear INT16.
-
-    Returns list of (name, [meta], [data]) tuples, each a single-layer test.
-    """
-    tests = []
-
-    def _add(name, meta, raw_data):
-        data = {
-            'wgt': np.array([], dtype=np.uint32),
-            'param': raw_data['param_words'],
-            'input': raw_data['input_words'],
-            'output': raw_data['output_words'],
-        }
-        tests.append((name, [meta], [data]))
-
-    # Test 0: Nearest resize INT8 (4x4x4 -> 8x8x4)
-    meta, raw = gen_resize_test(in_h=4, in_w=4, in_c=4,
-                                out_h=8, out_w=8,
-                                resize_mode=0, int16_mode=False, seed=120)
-    _add('resize_nearest_int8', meta, raw)
-
-    # Test 1: Bilinear resize INT16 (4x4x4 -> 8x8x4)
-    meta, raw = gen_resize_test(in_h=4, in_w=4, in_c=4,
-                                out_h=8, out_w=8,
-                                resize_mode=1, int16_mode=True, seed=121)
-    _add('resize_bilinear_int16', meta, raw)
-
-    # Test 2: Nearest resize INT16 (4x4x4 -> 8x8x4)
-    meta, raw = gen_resize_test(in_h=4, in_w=4, in_c=4,
-                                out_h=8, out_w=8,
-                                resize_mode=0, int16_mode=True, seed=122)
-    _add('resize_nearest_int16', meta, raw)
-
-    return tests
-
-
-def generate_deconv_test_data():
-    """Generate 2 Deconv test cases: INT8, INT16.
-
-    Returns list of (name, [meta], [data]) tuples, each a single-layer test.
-    """
-    tests = []
-
-    def _add(name, meta, raw_data):
-        data = {
-            'wgt': raw_data['wgt_words'],
-            'param': raw_data['param_words'],
-            'input': raw_data['input_words'],
-            'output': raw_data['output_words'],
-        }
-        tests.append((name, [meta], [data]))
-
-    # Test 0: Deconv 2x2, insert_h=1, INT8 (4x4x4 -> 7x7x4)
-    meta, raw = gen_deconv_test(in_h=4, in_w=4, in_c=4, out_c=4,
-                                kernel_h=2, kernel_w=2, insert_h=1, insert_w=1,
-                                pad_top=0, pad_left=0,
-                                int16_mode=False, seed=200)
-    _add('deconv_int8', meta, raw)
-
-    # Test 1: Deconv 3x3, insert_h=1, INT16 (4x4x4 -> 9x9x4)
-    meta, raw = gen_deconv_test(in_h=4, in_w=4, in_c=4, out_c=4,
-                                kernel_h=3, kernel_w=3, insert_h=1, insert_w=1,
-                                pad_top=1, pad_left=1,
-                                int16_mode=True, seed=201)
-    _add('deconv_int16', meta, raw)
-
-    return tests
-
-
-def generate_concat_test_data():
-    """Generate 2 Concat test cases: INT8, INT16 (single branch = rescale only).
-
-    Returns list of (name, [meta], [data]) tuples.
-    """
-    tests = []
-
-    def _add(name, branch_results, output_words, total_c, dtype):
-        meta, raw_data = branch_results[0]
-        meta['dma_param_count'] = 1
-        meta['n_output_words'] = len(output_words)
-        # Recompute dma_out_size for packed output
-        meta['dma_out_size'] = len(output_words) * 4
-        data = {
-            'wgt': np.array([], dtype=np.uint32),
-            'param': np.array(raw_data['add_param_words'], dtype=np.uint32),
-            'input': raw_data['input_words'],
-            'output': output_words,
-        }
-        tests.append((name, [meta], [data]))
-
-    # Test 0: Concat INT8 (single branch, 4x4x4 → 4x4x4, rescale + relu)
-    branch_results, output_words, total_c = gen_concat_test(
-        h=4, w=4, branches=[{'in_c': 4}], relu=True,
-        int16_mode=False, seed=200)
-    _add('concat_int8', branch_results, output_words, total_c, 'int8')
-
-    # Test 1: Concat INT16 (single branch, 4x4x4 → 4x4x4, rescale + relu)
-    branch_results, output_words, total_c = gen_concat_test(
-        h=4, w=4, branches=[{'in_c': 4}], relu=True,
-        int16_mode=True, seed=201)
-    _add('concat_int16', branch_results, output_words, total_c, 'int16')
-
-    return tests
-
-
-def generate_add_test_data():
-    """Generate 2 Eltwise Add test cases: INT8, INT16.
-
-    Returns list of (name, [meta], [data]) tuples.
-    """
-    tests = []
-
-    def _add(name, meta, raw_data):
-        meta['dma_param_count'] = 1
-        data = {
-            'wgt': np.array([], dtype=np.uint32),
-            'param': np.array(raw_data['add_param_words'], dtype=np.uint32),
-            'input': raw_data['input_a_words'],
-            'input_b': raw_data['input_b_words'],
-            'output': raw_data['output_words'],
-        }
-        tests.append((name, [meta], [data]))
-
-    # Test 0: Eltwise Add INT8 (4x4x8, relu)
-    meta, raw = gen_add_test(h=4, w=4, c=8, relu=True, int16_mode=False, seed=100)
-    _add('add_int8', meta, raw)
-
-    # Test 1: Eltwise Add INT16 (4x4x8, relu)
-    meta, raw = gen_add_test(h=4, w=4, c=8, relu=True, int16_mode=True, seed=101)
-    _add('add_int16', meta, raw)
-
-    return tests
-
-
-def convert_allops_invocations(invocations):
-    """Convert AllOps-Mini invocations to (meta_list, data_list) for build_blob()."""
-    metas, datas = [], []
-    for inv in invocations:
-        meta = dict(inv['meta'])
-        data = inv['data']
-        op = meta['op_type']
-
-        converted = {
-            'wgt': np.array(data.get('wgt_words', []), dtype=np.uint32),
-            'param': np.array([], dtype=np.uint32),
-            'input': np.array(data['input_words'], dtype=np.uint32),
-            'output': np.array(data['output_words'], dtype=np.uint32),
-        }
-
-        if op in (4, 7):  # Add, Concat: use add_param_words
-            converted['param'] = np.array(data.get('add_param_words', []), dtype=np.uint32)
-            meta['dma_param_count'] = 1
-        else:
-            converted['param'] = np.array(data.get('param_words', []), dtype=np.uint32)
-
-        if op == 4 and 'input_b_words' in data:
-            converted['input_b'] = np.array(data['input_b_words'], dtype=np.uint32)
-
-        # Compute DMA sizes
-        meta['dma_in_size'] = len(converted['input']) * 4
-        meta['dma_wgt_size'] = len(converted['wgt']) * 4
-
-        # Concat: use dma_out_size_override (both branches DMA the full combined output)
-        if op == 7 and 'dma_out_size_override' in inv['meta']:
-            meta['dma_out_size'] = inv['meta']['dma_out_size_override']
-        else:
-            meta['dma_out_size'] = len(converted['output']) * 4
-
-        metas.append(meta)
-        datas.append(converted)
-    return metas, datas
-
-
-def generate():
-    print('=== SoC Test Data Generator ===')
-    print(f'Golden source: {GOLDEN_DIR}')
-
-    # Load MobileNet models
-    meta_int8, data_int8 = load_golden('int8')
-    meta_int16, data_int16 = load_golden('int16')
-
-    print(f'INT8:  {len(meta_int8)} layers')
-    print(f'INT16: {len(meta_int16)} layers')
-
-    # Build MobileNet blobs
-    blob_int8 = build_blob(meta_int8, data_int8)
-    blob_int16 = build_blob(meta_int16, data_int16)
-
-    print(f'INT8 blob:  {len(blob_int8)} bytes')
-    print(f'INT16 blob: {len(blob_int16)} bytes')
-
-    # Generate pool test data
-    pool_tests = generate_pooling_test_data()
-    pool_blobs = {}
-    for name, meta, data in pool_tests:
-        pool_blobs[name] = build_blob(meta, data)
-        print(f'{name} blob:  {len(pool_blobs[name])} bytes')
-
-    # Generate resize test data
-    resize_tests = generate_resize_test_data()
-    resize_blobs = {}
-    for name, meta, data in resize_tests:
-        resize_blobs[name] = build_blob(meta, data)
-        print(f'{name} blob:  {len(resize_blobs[name])} bytes')
-
-    # Generate deconv test data
-    deconv_tests = generate_deconv_test_data()
-    deconv_blobs = {}
-    for name, meta, data in deconv_tests:
-        deconv_blobs[name] = build_blob(meta, data)
-        print(f'{name} blob:  {len(deconv_blobs[name])} bytes')
-
-    # Generate concat test data
-    concat_tests = generate_concat_test_data()
-    concat_blobs = {}
-    for name, meta, data in concat_tests:
-        concat_blobs[name] = build_blob(meta, data)
-        print(f'{name} blob:  {len(concat_blobs[name])} bytes')
-
-    # Generate add test data
-    add_tests = generate_add_test_data()
-    add_blobs = {}
-    for name, meta, data in add_tests:
-        add_blobs[name] = build_blob(meta, data)
-        print(f'{name} blob:  {len(add_blobs[name])} bytes')
-
-    # Generate DWConv test data
-    dwconv_tests = generate_dwconv_test_data()
-    dwconv_blobs = {}
-    for name, meta, data in dwconv_tests:
-        dwconv_blobs[name] = build_blob(meta, data)
-        print(f'{name} blob:  {len(dwconv_blobs[name])} bytes')
-
-    # Generate Conv2D test data
-    conv2d_tests = generate_conv2d_test_data()
-    conv2d_blobs = {}
-    for name, meta, data in conv2d_tests:
-        conv2d_blobs[name] = build_blob(meta, data)
-        print(f'{name} blob:  {len(conv2d_blobs[name])} bytes')
-
-    # Generate FC test data
-    fc_tests = generate_fc_test_data()
-    fc_blobs = {}
-    for name, meta, data in fc_tests:
-        fc_blobs[name] = build_blob(meta, data)
-        print(f'{name} blob:  {len(fc_blobs[name])} bytes')
-
-    # Generate AllOps-Mini full model (18 layers, all 7 ops) INT8 + INT16
-    print('Building AllOps-Mini INT8...')
-    invocations_int8 = build_allops_mini(int16_mode=False)
-    meta_allops_int8, data_allops_int8 = convert_allops_invocations(invocations_int8)
-    blob_allops_int8 = build_blob(meta_allops_int8, data_allops_int8)
-    print(f'AllOps-Mini INT8 blob: {len(blob_allops_int8)} bytes ({len(meta_allops_int8)} layers)')
-
-    print('Building AllOps-Mini INT16...')
-    invocations_int16 = build_allops_mini(int16_mode=True)
-    meta_allops_int16, data_allops_int16 = convert_allops_invocations(invocations_int16)
-    blob_allops_int16 = build_blob(meta_allops_int16, data_allops_int16)
-    print(f'AllOps-Mini INT16 blob: {len(blob_allops_int16)} bytes ({len(meta_allops_int16)} layers)')
-
-    # Compute addresses
-    blob_int8_bytes = len(blob_int8)
-    blob_int8_aligned = (blob_int8_bytes + 3) & ~3
-    global BLOB_INT16_BASE
-    BLOB_INT16_BASE = BLOB_INT8_BASE + blob_int8_aligned
-    print(f'INT16 blob @ 0x{BLOB_INT16_BASE:08X}')
-
-    blob_int16_aligned = (len(blob_int16) + 3) & ~3
-    pool_base = BLOB_INT16_BASE + blob_int16_aligned
-    pool_addrs = {}
-    for name in ['pool_max_int8', 'pool_avg_int8', 'pool_global_int8', 'pool_max_int16', 'pool_avg_int16', 'pool_global_int16']:
-        pool_addrs[name] = pool_base
-        print(f'{name} blob @ 0x{pool_base:08X}')
-        pool_base += (len(pool_blobs[name]) + 3) & ~3
-
-    resize_addrs = {}
-    for name in ['resize_nearest_int8', 'resize_bilinear_int16', 'resize_nearest_int16']:
-        resize_addrs[name] = pool_base
-        print(f'{name} blob @ 0x{pool_base:08X}')
-        pool_base += (len(resize_blobs[name]) + 3) & ~3
-
-    deconv_addrs = {}
-    for name in ['deconv_int8', 'deconv_int16']:
-        deconv_addrs[name] = pool_base
-        print(f'{name} blob @ 0x{pool_base:08X}')
-        pool_base += (len(deconv_blobs[name]) + 3) & ~3
-
-    concat_addrs = {}
-    for name in ['concat_int8', 'concat_int16']:
-        concat_addrs[name] = pool_base
-        print(f'{name} blob @ 0x{pool_base:08X}')
-        pool_base += (len(concat_blobs[name]) + 3) & ~3
-
-    add_addrs = {}
-    for name in ['add_int8', 'add_int16']:
-        add_addrs[name] = pool_base
-        print(f'{name} blob @ 0x{pool_base:08X}')
-        pool_base += (len(add_blobs[name]) + 3) & ~3
-
-    dwconv_addrs = {}
-    for name in ['dwconv_int8', 'dwconv_int16']:
-        dwconv_addrs[name] = pool_base
-        print(f'{name} blob @ 0x{pool_base:08X}')
-        pool_base += (len(dwconv_blobs[name]) + 3) & ~3
-
-    fc_addrs = {}
-    for name in ['fc_int8', 'fc_int16']:
-        fc_addrs[name] = pool_base
-        print(f'{name} blob @ 0x{pool_base:08X}')
-        pool_base += (len(fc_blobs[name]) + 3) & ~3
-
-    conv2d_addrs = {}
-    for name in ['conv2d_int8', 'conv2d_int16']:
-        conv2d_addrs[name] = pool_base
-        print(f'{name} blob @ 0x{pool_base:08X}')
-        pool_base += (len(conv2d_blobs[name]) + 3) & ~3
-
-    # AllOps-Mini blobs
-    allops_int8_base = pool_base
-    print(f'AllOps-Mini INT8 blob @ 0x{allops_int8_base:08X}')
-    pool_base += (len(blob_allops_int8) + 3) & ~3
-
-    allops_int16_base = pool_base
-    print(f'AllOps-Mini INT16 blob @ 0x{allops_int16_base:08X}')
-    pool_base += (len(blob_allops_int16) + 3) & ~3
-
-    # Write concatenated test_data.bin
-    with open(BLOB_FILE, 'wb') as f:
-        f.write(blob_int8)
-        f.write(blob_int16)
-        for name in ['pool_max_int8', 'pool_avg_int8', 'pool_global_int8', 'pool_max_int16', 'pool_avg_int16', 'pool_global_int16']:
-            f.write(pool_blobs[name])
-        for name in ['resize_nearest_int8', 'resize_bilinear_int16', 'resize_nearest_int16']:
-            f.write(resize_blobs[name])
-        for name in ['deconv_int8', 'deconv_int16']:
-            f.write(deconv_blobs[name])
-        for name in ['concat_int8', 'concat_int16']:
-            f.write(concat_blobs[name])
-        for name in ['add_int8', 'add_int16']:
-            f.write(add_blobs[name])
-        for name in ['dwconv_int8', 'dwconv_int16']:
-            f.write(dwconv_blobs[name])
-        for name in ['fc_int8', 'fc_int16']:
-            f.write(fc_blobs[name])
-        for name in ['conv2d_int8', 'conv2d_int16']:
-            f.write(conv2d_blobs[name])
-        f.write(blob_allops_int8)
-        f.write(blob_allops_int16)
-    print(f'Generated {BLOB_FILE} ({os.path.getsize(BLOB_FILE)} bytes)')
-
-    # Generate C header
-    generate_header(meta_int8, meta_int16, blob_int8_bytes, pool_addrs, resize_addrs,
-                    deconv_addrs, concat_addrs, add_addrs, dwconv_addrs, fc_addrs, conv2d_addrs, allops_int8_base, allops_int16_base)
-
-    print(f'\nDone. Next: make && cd ../sim && make run')
-
-
-def generate_header(meta_int8, meta_int16, blob_int8_size, pool_addrs=None, resize_addrs=None, deconv_addrs=None, concat_addrs=None, add_addrs=None, dwconv_addrs=None, fc_addrs=None, conv2d_addrs=None, allops_int8_base=None, allops_int16_base=None):
-    """Generate C header with blob addresses and sizes."""
-    h = []
-    h.append('/* Auto-generated by gen_soc_test.py — do not edit */')
-    h.append('#ifndef SOC_TEST_DATA_H')
-    h.append('#define SOC_TEST_DATA_H')
-    h.append('#include <stdint.h>')
-    h.append('')
-
-    # Blob address macros
-    h.append('/* Blob base addresses in main RAM */')
-    h.append(f'#define BLOB_INT8_BASE  0x{BLOB_INT8_BASE:08X}')
-    h.append(f'#define BLOB_INT16_BASE 0x{BLOB_INT16_BASE:08X}')
-    if pool_addrs:
-        for name, addr in pool_addrs.items():
-            define_name = 'BLOB_' + name.upper() + '_BASE'
-            h.append(f'#define {define_name}  0x{addr:08X}')
-    if resize_addrs:
-        for name, addr in resize_addrs.items():
-            define_name = 'BLOB_' + name.upper() + '_BASE'
-            h.append(f'#define {define_name}  0x{addr:08X}')
-    if deconv_addrs:
-        for name, addr in deconv_addrs.items():
-            define_name = 'BLOB_' + name.upper() + '_BASE'
-            h.append(f'#define {define_name}  0x{addr:08X}')
-    if concat_addrs:
-        for name, addr in concat_addrs.items():
-            define_name = 'BLOB_' + name.upper() + '_BASE'
-            h.append(f'#define {define_name}  0x{addr:08X}')
-    if add_addrs:
-        for name, addr in add_addrs.items():
-            define_name = 'BLOB_' + name.upper() + '_BASE'
-            h.append(f'#define {define_name}  0x{addr:08X}')
-    if dwconv_addrs:
-        for name, addr in dwconv_addrs.items():
-            define_name = 'BLOB_' + name.upper() + '_BASE'
-            h.append(f'#define {define_name}  0x{addr:08X}')
-    if fc_addrs:
-        for name, addr in fc_addrs.items():
-            define_name = 'BLOB_' + name.upper() + '_BASE'
-            h.append(f'#define {define_name}  0x{addr:08X}')
-    if conv2d_addrs:
-        for name, addr in conv2d_addrs.items():
-            define_name = 'BLOB_' + name.upper() + '_BASE'
-            h.append(f'#define {define_name}  0x{addr:08X}')
-    if allops_int8_base:
-        h.append(f'#define BLOB_ALLOPS_INT8_BASE  0x{allops_int8_base:08X}')
-    if allops_int16_base:
-        h.append(f'#define BLOB_ALLOPS_INT16_BASE  0x{allops_int16_base:08X}')
-    h.append('')
-
-    # NPU DMA workspace addresses
-    h.append('/* NPU DMA workspace addresses in main RAM */')
-    h.append(f'#define NPU_WGT_BASE     0x{NPU_WGT_BASE:08X}')
-    h.append(f'#define NPU_PARAM_BASE   0x{NPU_PARAM_BASE:08X}')
-    h.append(f'#define NPU_INPUT_BASE   0x{NPU_INPUT_BASE:08X}')
-    h.append(f'#define NPU_OUTPUT_BASE  0x{NPU_OUTPUT_BASE:08X}')
-    h.append('')
-
-    # Per-entry header layout (16 uint32 words)
-    h.append('/* Per-layer blob entry header layout (16 uint32 words per layer) */')
-    h.append('typedef struct {')
-    h.append('    uint32_t n_wgt;          /* [0]  weight word count */')
-    h.append('    uint32_t n_param;        /* [1]  param word count */')
-    h.append('    uint32_t n_input;        /* [2]  input word count */')
-    h.append('    uint32_t n_output;       /* [3]  output word count */')
-    h.append('    uint32_t op_type;        /* [4]  operator type */')
-    h.append('    uint32_t data_type;      /* [5]  INT8=0, INT16=1 */')
-    h.append('    uint32_t in_hw;          /* [6]  in_h | (in_w << 16) */')
-    h.append('    uint32_t in_c;           /* [7]  input channels */')
-    h.append('    uint32_t out_hw;         /* [8]  out_h | (out_w << 16) */')
-    h.append('    uint32_t out_c;          /* [9]  output channels */')
-    h.append('    uint32_t kernel_dil;     /* [10] kh | (kw<<8) | (dh<<16) | (dw<<24) */')
-    h.append('    uint32_t stride;         /* [11] sh | (sw << 8) */')
-    h.append('    uint32_t padding;        /* [12] top | (bot<<8) | (left<<16) | (right<<24) */')
-    h.append('    uint32_t post_ctrl;      /* [13] PPU post-processing control */')
-    h.append('    uint32_t param_count;    /* [14] per-channel param count */')
-    h.append('    uint32_t dma_in_size;    /* [15] DMA input transfer size (bytes) */')
-    h.append('    uint32_t dma_wgt_size;   /* [16] DMA weight transfer size (bytes) */')
-    h.append('    uint32_t dma_out_size;   /* [17] DMA output transfer size (bytes) */')
-    h.append('    uint32_t cfg_aux;        /* [18] operator-specific config (pool_cfg etc) */')
-    h.append('    /* Data follows: wgt[n_wgt*4], param[n_param*4], input[n_input*4], output[n_output*4] */')
-    h.append('} __attribute__((packed)) layer_entry_t;')
-    h.append('')
-
-    # Header sizes
-    h.append(f'#define LAYER_ENTRY_HDR_SIZE  {LAYER_ENTRY_HDR_WORDS * 4}')
-    h.append('')
-
-    # Blob header macros
-    h.append('/* Blob header offsets */')
-    h.append('#define BLOB_OFF_MAGIC      0')
-    h.append('#define BLOB_OFF_LAYERS    4')
-    h.append('#define BLOB_OFF_VERSION   8')
-    h.append('#define BLOB_OFF_DATA      12  /* first layer entry starts here */')
-    h.append('')
-
-    # Blob magic
-    h.append(f'#define BLOB_MAGIC 0x{MAGIC:08X}')
-    h.append('')
-
-    h.append('#endif /* SOC_TEST_DATA_H */')
-    h.append('')
+def generate_header(model_name, blob_size):
+    """Generate soc_test_data.h C header."""
+    blob_base = BLOB_BASE
 
     with open(HEADER_FILE, 'w') as f:
-        f.write('\n'.join(h))
-    print(f'Generated {HEADER_FILE}')
+        f.write("/* Auto-generated by gen_soc_test.py — do not edit */\n")
+        f.write("#ifndef SOC_TEST_DATA_H\n")
+        f.write("#define SOC_TEST_DATA_H\n")
+        f.write("#include <stdint.h>\n\n")
+
+        f.write(f"/* Model: {model_name} */\n")
+        f.write(f"#define BLOB_MODEL_BASE  0x{blob_base:08X}\n")
+        f.write(f"#define BLOB_MODEL_SIZE  {blob_size}\n\n")
+
+        f.write("/* Per-layer blob entry header (36 uint32 words = 144 bytes) */\n")
+        f.write("typedef struct {\n")
+        f.write("    uint32_t n_wgt;            /* [0]  */\n")
+        f.write("    uint32_t n_param;          /* [1]  */\n")
+        f.write("    uint32_t n_input;          /* [2]  */\n")
+        f.write("    uint32_t n_output;         /* [3]  */\n")
+        f.write("    uint32_t op_type;          /* [4]  */\n")
+        f.write("    uint32_t data_type;        /* [5]  */\n")
+        f.write("    uint32_t in_hw;            /* [6]  */\n")
+        f.write("    uint32_t in_c;             /* [7]  */\n")
+        f.write("    uint32_t out_hw;           /* [8]  */\n")
+        f.write("    uint32_t out_c;            /* [9]  */\n")
+        f.write("    uint32_t kernel_dil;       /* [10] */\n")
+        f.write("    uint32_t stride;           /* [11] */\n")
+        f.write("    uint32_t padding;          /* [12] */\n")
+        f.write("    uint32_t post_ctrl;        /* [13] */\n")
+        f.write("    uint32_t param_count;      /* [14] */\n")
+        f.write("    uint32_t dma_in_size;      /* [15] */\n")
+        f.write("    uint32_t dma_wgt_size;     /* [16] */\n")
+        f.write("    uint32_t dma_out_size;     /* [17] */\n")
+        f.write("    uint32_t cfg_aux;          /* [18] */\n")
+        f.write("    uint32_t tile_cfg;         /* [19] */\n")
+        f.write("    uint32_t tile_count;       /* [20] */\n")
+        f.write("    uint32_t sched_ctrl;       /* [21] */\n")
+        f.write("    uint32_t store_mode;       /* [22] */\n")
+        f.write("    uint32_t tile_in_size;     /* [23] */\n")
+        f.write("    uint32_t tile_out_size;    /* [24] */\n")
+        f.write("    uint32_t row_cfg;          /* [25] */\n")
+        f.write("    uint32_t wgt_per_oc_words; /* [26] */\n")
+        f.write("    uint32_t clamp_max;        /* [27] */\n")
+        f.write("    uint32_t in_zp;            /* [28] */\n")
+        f.write("    uint32_t ddr_wgt_addr;     /* [29] */\n")
+        f.write("    uint32_t ddr_param_addr;   /* [30] */\n")
+        f.write("    uint32_t ddr_out_addr;     /* [31] */\n")
+        f.write("    uint32_t ddr_in_addr;      /* [32] */\n")
+        f.write("    uint32_t ddr_add_b_addr;   /* [33] */\n")
+        f.write("    int32_t  input_src;        /* [34] -1=chain, N=skip */\n")
+        f.write("    int32_t  residual_src;     /* [35] -1=none, N=branch B */\n")
+        f.write("} __attribute__((packed)) layer_entry_t;\n\n")
+
+        f.write(f"#define LAYER_ENTRY_HDR_SIZE  {LAYER_ENTRY_HDR_SIZE}\n")
+        f.write(f"#define LAYER_ENTRY_HDR_WORDS {LAYER_ENTRY_HDR_WORDS}\n\n")
+
+        f.write("/* Blob header */\n")
+        f.write("#define BLOB_MAGIC 0x4E505532\n")
+        f.write("#define BLOB_OFF_MAGIC   0\n")
+        f.write("#define BLOB_OFF_LAYERS  4\n")
+        f.write("#define BLOB_OFF_VERSION 8\n")
+        f.write("#define BLOB_OFF_DATA    12\n\n")
+
+        f.write("#endif /* SOC_TEST_DATA_H */\n")
+
+    print(f"Generated {HEADER_FILE}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate SoC test data for chained model inference')
+    parser.add_argument('--model', required=True,
+                        choices=['model_a_int16', 'model_b_int16', 'model_c_int16', 'model_d_int16'],
+                        help='Model to generate')
+    args = parser.parse_args()
+
+    print(f"Loading golden data for {args.model}...")
+    meta, data = load_model_golden(args.model)
+    print(f"  {len(meta)} layers loaded")
+
+    # Check which layers have valid golden data
+    valid = sum(1 for d in data if len(d['output']) > 0)
+    print(f"  {valid}/{len(meta)} layers have golden output")
+
+    # Filter to only layers with golden data
+    # (fused block intermediates may not have golden output)
+    # For chained inference, we need ALL layers — skip those without output
+    # Actually, we need all layers for chaining, but can only verify those with output
+    # For now, include all layers; firmware will skip verification for empty output
+
+    print(f"Building chained blob...")
+    blob = build_chained_blob(meta, data)
+    print(f"  Blob size: {len(blob)} bytes ({len(blob)/1024/1024:.1f} MB)")
+
+    with open(BLOB_FILE, 'wb') as f:
+        f.write(blob)
+    print(f"Written {BLOB_FILE}")
+
+    generate_header(args.model, len(blob))
+
+    # Print DDR usage summary
+    ddr_addrs = []
+    for m in meta:
+        for k in ['ddr_in_addr', 'ddr_out_addr', 'ddr_wgt_addr', 'ddr_param_addr', 'ddr_add_b_addr']:
+            v = m.get(k, 0)
+            if v > 0:
+                ddr_addrs.append(remap_ddr(v))
+    if ddr_addrs:
+        print(f"  DDR range: 0x{min(ddr_addrs):08X} - 0x{max(ddr_addrs):08X} "
+              f"({(max(ddr_addrs)-min(ddr_addrs))/1024/1024:.1f} MB)")
 
 
 if __name__ == '__main__':
-    generate()
+    main()

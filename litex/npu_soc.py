@@ -57,7 +57,7 @@ class NPUSoC(SoCCore):
             clk_freq                 = int(50e6),
             integrated_rom_size      = 64 * 1024,
             integrated_sram_size     = 8 * 1024,
-            integrated_main_ram_size = 256 * 1024,
+            integrated_main_ram_size = 48 * 1024 * 1024,
             ident                    = "Open-NPU SoC",
             uart_name                = "sim",
             **kwargs,

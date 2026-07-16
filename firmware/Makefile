@@ -11,7 +11,7 @@ OBJDUMP = $(CROSS)objdump
 # VexRiscv standard variant: rv32im (no compressed, no atomic)
 ARCH    = -march=rv32im -mabi=ilp32
 
-CFLAGS  = $(ARCH) -Os -Wall -Wextra -ffreestanding -nostdlib -nostartfiles
+CFLAGS  = $(ARCH) -Os -Wall -Wextra -ffreestanding -nostdlib -nostartfiles $(DEFINES)
 ASFLAGS = $(ARCH) -ffreestanding -nostdlib
 LDFLAGS = $(ARCH) -nostdlib -nostartfiles -Wl,-T,linker.ld -Wl,--gc-sections
 
@@ -31,9 +31,12 @@ SIM_DIR = ../sim
 
 all: $(TARGET).bin $(TARGET).hex $(MAIN_RAM_INIT)
 
+# Model selection (passed via DEFINES)
+MODEL ?= model_b_int16
+
 # Generate test data header and binary blob together
 $(TEST_DATA_H) $(TEST_DATA_BIN):
-	python3 gen_soc_test.py
+	python3 gen_soc_test.py --model $(MODEL)
 
 %.o: %.c $(TEST_DATA_H)
 	$(CC) $(CFLAGS) -c $< -o $@

@@ -1,11 +1,9 @@
 /*
- * Open-NPU SoC Firmware — Multi-Layer E2E Test Runner
+ * Open-NPU SoC Firmware — Chained Model Inference Test Runner
  *
- * Runs MobileNetV2-Tiny (10 layers) in both INT8 and INT16 modes,
- * using pre-loaded golden test data in main RAM.
- *
- * Test data is loaded via $readmemh into main RAM at SoC startup.
- * Blob format: header + per-layer entries with CSR configs + data.
+ * Runs INT16 model (a/b/c/d) with chained inference:
+ * Layer N output → Layer N+1 input (DDR). Supports tiling,
+ * per-OC weight reload, fused blocks, skip-connections, Add/Concat.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -15,24 +13,18 @@
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Memory map
- * ═══════════════════════════════════════════════════════════════════ */
+ *  ═══════════════════════════════════════════════════════════════════ */
 #define MAIN_RAM_BASE   0x40000000UL
 #define NPU_BASE_ADDR   0x80000000UL
-#define NPU_ADD_B_BASE  0x4003C000UL  /* Add Branch B input workspace */
 
 /* UART (LiteX CSR UART) */
 #define UART_RXTX       (*(volatile uint32_t *)0xF0001800UL)
 #define UART_TXFULL     (*(volatile uint32_t *)0xF0001804UL)
 
 /* ═══════════════════════════════════════════════════════════════════
- *  NPU register offsets (from npu_hal.h)
- * ═══════════════════════════════════════════════════════════════════ */
+ *  NPU register offsets
+ *  ═══════════════════════════════════════════════════════════════════ */
 #define NPU_REG(off) (*(volatile uint32_t *)(NPU_BASE_ADDR + (off)))
-
-/* VexRiscv custom instruction: invalidate entire data cache */
-static inline void dcache_flush(void) {
-    asm volatile(".word 0x500F" : : : "memory");
-}
 
 #define REG_CTRL            0x000
 #define REG_STATUS          0x004
@@ -40,7 +32,6 @@ static inline void dcache_flush(void) {
 #define REG_IRQ_STATUS      0x00C
 #define REG_VERSION         0x014
 #define REG_HW_CONFIG       0x018
-#define REG_LAYER_COUNT     0x030
 #define REG_LAYER_MODE      0x040
 #define REG_IN_DIM_HW       0x044
 #define REG_IN_DIM_C        0x048
@@ -67,6 +58,11 @@ static inline void dcache_flush(void) {
 #define REG_DMA_IN_SIZE     0x128
 #define REG_DMA_WGT_SIZE    0x12C
 #define REG_DMA_OUT_SIZE    0x130
+#define REG_DMA_TILE_IN_SIZE 0x134
+#define REG_DMA_TILE_OUT_SIZE 0x138
+#define REG_DMA_STORE_MODE  0x140
+#define REG_DMA_ROW_CFG     0x144
+#define REG_DMA_WGT_PER_OC  0x148
 #define REG_POST_CTRL       0x180
 #define REG_POST_PARAM_CNT  0x188
 #define REG_POST_CLAMP      0x18C
@@ -80,9 +76,11 @@ static inline void dcache_flush(void) {
 #define STATUS_DONE     (1U << 3)
 #define STATUS_ERROR    (1U << 2)
 
+#define MAX_LAYERS 80
+
 /* ═══════════════════════════════════════════════════════════════════
  *  UART helpers
- * ═══════════════════════════════════════════════════════════════════ */
+ *  ═══════════════════════════════════════════════════════════════════ */
 static void uart_putc(char c) {
     while (UART_TXFULL) {}
     UART_RXTX = (uint32_t)c;
@@ -111,13 +109,10 @@ static void uart_put_dec(int32_t v) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  Data copy helpers (inline-friendly to avoid libc memcpy)
- * ═══════════════════════════════════════════════════════════════════ */
-__attribute__((noinline))
-static void memcpy_32(uint32_t dst, const uint32_t *src, uint32_t n_words) {
-    volatile uint32_t *d = (volatile uint32_t *)dst;
-    for (uint32_t i = 0; i < n_words; i++)
-        d[i] = src[i];
+ *  DCache flush (VexRiscv custom instruction)
+ *  ═══════════════════════════════════════════════════════════════════ */
+static inline void dcache_flush(void) {
+    asm volatile(".word 0x500F" : : : "memory");
 }
 
 /* Provide memcpy to satisfy compiler-generated calls */
@@ -132,7 +127,7 @@ void *memcpy(void *dst, const void *src, uint32_t n) {
 
 /* ═══════════════════════════════════════════════════════════════════
  *  NPU helpers
- * ═══════════════════════════════════════════════════════════════════ */
+ *  ═══════════════════════════════════════════════════════════════════ */
 static void npu_reset(void) {
     NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
     for (volatile int i = 0; i < 100; i++) {}
@@ -141,7 +136,7 @@ static void npu_reset(void) {
 }
 
 static int npu_wait_done(void) {
-    uint32_t timeout = 500000;
+    uint32_t timeout = 50000000;  /* 50M cycles — enough for large layers */
     while (timeout--) {
         uint32_t irq_st = NPU_REG(REG_IRQ_STATUS);
         uint32_t status = NPU_REG(REG_STATUS);
@@ -152,141 +147,117 @@ static int npu_wait_done(void) {
     return -2; /* timeout */
 }
 
-static void npu_program_layer(const uint32_t *entry_hdr, uint32_t n_input_words) {
-    /*
-     * entry_hdr layout (see soc_test_data.h layer_entry_t):
-     *   [0]  n_wgt
-     *   [1]  n_param
-     *   [2]  n_input
-     *   [3]  n_output
-     *   [4]  op_type
-     *   [5]  data_type
-     *   [6]  in_hw
-     *   [7]  in_c
-     *   [8]  out_hw
-     *   [9]  out_c
-     *   [10] kernel_dil
-     *   [11] stride
-     *   [12] padding
-     *   [13] post_ctrl
-     *   [14] param_count
-     *   [15] dma_in_size
-     *   [16] dma_wgt_size
-     *   [17] dma_out_size
-     */
-    uint32_t op_type   = entry_hdr[4];
-    uint32_t data_type = entry_hdr[5];
-    uint32_t in_hw     = entry_hdr[6];
-    uint32_t in_c      = entry_hdr[7];
-    uint32_t out_hw    = entry_hdr[8];
-    uint32_t out_c     = entry_hdr[9];
-    uint32_t kernel_dil= entry_hdr[10];
-    uint32_t stride    = entry_hdr[11];
-    uint32_t padding   = entry_hdr[12];
-    uint32_t post_ctrl = entry_hdr[13];
-    uint32_t param_cnt = entry_hdr[14];
-    uint32_t dma_in_sz = entry_hdr[15];
-    uint32_t dma_wgt_sz= entry_hdr[16];
-        uint32_t dma_out_sz= entry_hdr[17];
-        uint32_t cfg_aux     = entry_hdr[18];
+/*
+ * npu_program_layer — program ALL CSRs from 36-word layer_entry_t.
+ * Mirrors test_npu_dma_e2e.py:program_layer() CSR sequence.
+ *
+ * Parameters:
+ *   e: pointer to 36-word layer entry
+ *   runtime_in_addr: resolved input DDR address (layer 0: from entry[32],
+ *                    N>0: producing layer's ddr_out_addr)
+ *   runtime_add_b_addr: resolved Add/Concat branch-B DDR address (0 if none)
+ *   act_base: SRAM act base (0 for normal; 0 for fused — RTL handles reuse)
+ */
+static void npu_program_layer(const uint32_t *e,
+                              uint32_t runtime_in_addr,
+                              uint32_t runtime_add_b_addr,
+                              uint32_t act_base) {
+    uint32_t op_type   = e[4];
+    uint32_t data_type = e[5];
+    uint32_t in_zp     = e[28];
+    uint32_t sched     = e[21];
 
-        /* Layer mode: bits[3:0]=op_type, bit[4]=data_type */
-    NPU_REG(REG_LAYER_MODE) = (op_type & 0xF) | ((data_type & 1) << 4);
+    /* Layer mode: op_type | data_type | in_zp */
+    NPU_REG(REG_LAYER_MODE) = (op_type & 0xF) | ((data_type & 1) << 4)
+                              | ((in_zp & 0xFFFF) << 8);
 
     /* Dimensions */
-    NPU_REG(REG_IN_DIM_HW)  = in_hw;
-    NPU_REG(REG_IN_DIM_C)   = in_c;
-    NPU_REG(REG_OUT_DIM_HW) = out_hw;
-    NPU_REG(REG_OUT_DIM_C)  = out_c;
+    NPU_REG(REG_IN_DIM_HW)  = e[6];
+    NPU_REG(REG_IN_DIM_C)   = e[7];
+    NPU_REG(REG_OUT_DIM_HW) = e[8];
+    NPU_REG(REG_OUT_DIM_C)  = e[9];
 
-        /* Kernel (only bits 0-15 used; dilation bits ignored by hardware) */
-        NPU_REG(REG_KERNEL_SIZE) = kernel_dil & 0xFFFF;
-        NPU_REG(REG_STRIDE)      = stride;
-        NPU_REG(REG_PADDING)     = padding;
+    /* Kernel, stride, padding */
+    NPU_REG(REG_KERNEL_SIZE) = e[10] & 0xFFFF;
+    NPU_REG(REG_STRIDE)      = e[11];
+    NPU_REG(REG_PADDING)     = e[12];
 
-        /* Operator-specific config */
-        if (op_type == 3) {
-            NPU_REG(REG_POOL_CFG) = cfg_aux;
-        } else if (op_type == 5) {
-            NPU_REG(REG_RESIZE_CFG) = cfg_aux;
-        } else if (op_type == 6) {
-            NPU_REG(REG_DECONV_CFG) = cfg_aux;
-        } else if (op_type == 7) {
-            NPU_REG(REG_CONCAT_CFG) = cfg_aux;
-            /* Concat: both branches must use same out_base >= any branch input.
-             * Use out_base = max(n_input_words, dma_out_words) so that:
-             * 1) Input load never overlaps output region
-             * 2) Both Branch A and B compute the same out_base */
-            {
-                uint32_t dma_out_words = dma_out_sz / 4;
-                uint32_t safe_out_base = (dma_out_words > n_input_words)
-                                         ? dma_out_words : n_input_words;
-                NPU_REG(REG_SRAM_BASE) = safe_out_base << 16;
-            }
-        } else if (op_type == 4) {
-            NPU_REG(REG_DMA_ADD_B_ADDR) = NPU_ADD_B_BASE;
-            param_cnt = 1;  /* Add uses 1 rescale param set, not per-channel */
-        }
+    /* Operator-specific config */
+    uint32_t cfg_aux = e[18];
+    if (op_type == 3)      NPU_REG(REG_POOL_CFG)    = cfg_aux;
+    else if (op_type == 5) NPU_REG(REG_RESIZE_CFG)  = cfg_aux;
+    else if (op_type == 6) NPU_REG(REG_DECONV_CFG)  = cfg_aux;
+    else if (op_type == 7) NPU_REG(REG_CONCAT_CFG)  = cfg_aux;
 
-    /* No tiling */
-    NPU_REG(REG_TILE_CFG)   = 0;
-    NPU_REG(REG_TILE_COUNT) = 1 | (1 << 16);
+    /* Tiling */
+    NPU_REG(REG_TILE_CFG)   = e[19];  /* tile_h | (tile_w<<16) */
+    NPU_REG(REG_TILE_COUNT) = e[20];  /* tile_num_h | (tile_num_w<<16) */
 
-    /* SRAM base: act_base=0, out_base = n_input_words (output after input)
-     * Exception: Concat sets SRAM_BASE above for shared out_base */
-    if (op_type != 7) {
-        NPU_REG(REG_SRAM_BASE) = n_input_words << 16;
+    /* SRAM base: out_base = tile_in_size/4 if tiled, else dma_in_size/4 */
+    uint32_t out_base = (e[23] > 0) ? (e[23] / 4) : (e[15] / 4);
+    NPU_REG(REG_SRAM_BASE) = (out_base << 16) | act_base;
+
+    /* DMA addresses — runtime-resolved input, metadata for wgt/param/out */
+    NPU_REG(REG_DMA_IN_ADDR)    = runtime_in_addr;
+    NPU_REG(REG_DMA_OUT_ADDR)   = e[31];
+    NPU_REG(REG_DMA_WGT_ADDR)   = e[29];
+    NPU_REG(REG_DMA_PARAM_ADDR) = e[30];
+
+    /* Add/Concat branch B */
+    if (op_type == 4 || op_type == 7) {
+        NPU_REG(REG_DMA_ADD_B_ADDR) = runtime_add_b_addr;
     }
 
-    /* DMA addresses */
-    NPU_REG(REG_DMA_WGT_ADDR)   = NPU_WGT_BASE;
-    NPU_REG(REG_DMA_PARAM_ADDR) = NPU_PARAM_BASE;
-    NPU_REG(REG_DMA_IN_ADDR)    = NPU_INPUT_BASE;
-    NPU_REG(REG_DMA_OUT_ADDR)   = NPU_OUTPUT_BASE;
+    /* DMA sizes */
+    NPU_REG(REG_DMA_IN_SIZE)  = e[15];
+    NPU_REG(REG_DMA_WGT_SIZE) = e[16];
+    NPU_REG(REG_DMA_OUT_SIZE) = e[17];
 
-    /* DMA sizes (byte-aligned, already aligned to 4) */
-    NPU_REG(REG_DMA_IN_SIZE)  = dma_in_sz;
-    NPU_REG(REG_DMA_WGT_SIZE) = dma_wgt_sz;
-    NPU_REG(REG_DMA_OUT_SIZE) = dma_out_sz;
+    /* Per-OC weight reload */
+    NPU_REG(REG_DMA_WGT_PER_OC) = e[26];
 
-    /* Stride (not used, set to 0) */
+    /* Tiled DB_EN prefetch + PTS 2D DMA */
+    if (e[23] > 0) NPU_REG(REG_DMA_TILE_IN_SIZE) = e[23];
+    if (e[22] > 0) {
+        NPU_REG(REG_DMA_STORE_MODE)    = e[22];
+        NPU_REG(REG_DMA_TILE_OUT_SIZE) = e[24];
+        NPU_REG(REG_DMA_ROW_CFG)       = e[25];
+    }
+
+    /* Strides (contiguous) */
     NPU_REG(REG_DMA_IN_STRIDE)  = 0;
     NPU_REG(REG_DMA_OUT_STRIDE) = 0;
-    NPU_REG(REG_DMA_CTRL)       = 0;
+
+    /* DMA control: sched_ctrl (DB_EN/FUSE/PTS bits from metadata) */
+    NPU_REG(REG_DMA_CTRL) = sched;
 
     /* Post-processing */
-    NPU_REG(REG_POST_CTRL)      = post_ctrl;
-    NPU_REG(REG_POST_PARAM_CNT) = param_cnt;
-    NPU_REG(REG_POST_CLAMP)     = (uint32_t)(-128 & 0xFFFF) | ((127 & 0xFFFF) << 16);
+    NPU_REG(REG_POST_CTRL)      = e[13];
+    NPU_REG(REG_POST_PARAM_CNT) = e[14];
+    NPU_REG(REG_POST_CLAMP)     = e[27];  /* clamp_max in [15:0] */
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  Test runner
- * ═══════════════════════════════════════════════════════════════════ */
-
+ *  Chained model inference
+ *  ═══════════════════════════════════════════════════════════════════ */
 typedef struct {
-    uint32_t blob_base;      /* base address of blob in main RAM */
-    const char *name;        /* test name for UART output */
-    int num_layers;           /* filled by run_test_case */
+    uint32_t blob_base;
+    const char *name;
 } test_case_t;
 
-static int run_test_case(test_case_t *tc) {
+static int run_chained_model(test_case_t *tc) {
     uart_puts("\n  ----------------------------------------\n");
-    uart_puts("  Test: ");
+    uart_puts("  Model: ");
     uart_puts(tc->name);
     uart_puts("\n  ----------------------------------------\n");
 
-    /* Parse blob header */
     volatile const uint32_t *blob = (volatile const uint32_t *)(uintptr_t)tc->blob_base;
     uint32_t magic = blob[0];
     uint32_t num_layers = blob[1];
-    tc->num_layers = (int)num_layers;
 
     if (magic != BLOB_MAGIC) {
         uart_puts("  BLOB MAGIC MISMATCH: 0x");
         uart_put_hex32(magic);
-        uart_puts(" != 0x");
-        uart_put_hex32(BLOB_MAGIC);
         uart_puts("\n  SKIP\n");
         return -1;
     }
@@ -295,74 +266,73 @@ static int run_test_case(test_case_t *tc) {
     uart_put_dec(num_layers);
     uart_putc('\n');
 
-    /* Reset NPU */
-    npu_reset();
+    /* First pass: build layer_out_addr[] for skip/residual lookup */
+    uint32_t layer_out_addr[MAX_LAYERS];
+    const uint32_t *cursor = blob + 3;  /* skip 3-word blob header */
 
-    /* Current data pointer (skip 3-word blob header) */
-    const uint32_t *data_ptr = (const uint32_t *)(blob + 3);
+    for (uint32_t l = 0; l < num_layers && l < MAX_LAYERS; l++) {
+        const uint32_t *e = cursor;
+        layer_out_addr[l] = e[31];  /* ddr_out_addr */
+
+        /* Advance cursor past header + wgt + param + input + output */
+        cursor += LAYER_ENTRY_HDR_WORDS;
+        cursor += e[0];  /* n_wgt */
+        cursor += e[1];  /* n_param */
+        cursor += e[2];  /* n_input */
+        cursor += e[3];  /* n_output */
+    }
+
+    npu_reset();
     int total_err = 0;
+    cursor = blob + 3;
 
     for (uint32_t l = 0; l < num_layers; l++) {
-        /* Read entry header */
-        const uint32_t *hdr = data_ptr;
-        uint32_t n_wgt   = hdr[0];
-        uint32_t n_param = hdr[1];
-        uint32_t n_input = hdr[2];
-        uint32_t n_output= hdr[3];
+        const uint32_t *e = cursor;
 
-        /* Advance data pointer past header */
-        const uint32_t *payload = data_ptr + (LAYER_ENTRY_HDR_SIZE / 4);
+        uint32_t op_type = e[4];
+        int32_t input_src = (int32_t)e[34];
+        int32_t residual_src = (int32_t)e[35];
+        uint32_t sched = e[21];
 
-        /* Copy weights to NPU WGT workspace */
-        memcpy_32(NPU_WGT_BASE, payload, n_wgt);
-        payload += n_wgt;
-
-        /* Copy params to NPU PARAM workspace */
-        memcpy_32(NPU_PARAM_BASE, payload, n_param);
-        payload += n_param;
-
-        /* Copy input to NPU INPUT workspace (from blob) */
-        memcpy_32(NPU_INPUT_BASE, payload, n_input);
-        payload += n_input;
-
-        /* Golden output reference */
-        const uint32_t *golden = payload;
-        payload += n_output;
-
-        /* For Add: copy Branch B input to separate workspace */
-        uint32_t op_type = hdr[4];
-        if (op_type == 4) {
-            memcpy_32(NPU_ADD_B_BASE, payload, n_input);
-            payload += n_input;
+        /* Resolve runtime input address */
+        uint32_t runtime_in_addr;
+        if (l == 0) {
+            runtime_in_addr = e[32];  /* layer 0: use blob's ddr_in_addr */
+        } else if (input_src >= 0 && input_src < (int32_t)num_layers) {
+            runtime_in_addr = layer_out_addr[input_src];  /* skip connection */
+        } else {
+            runtime_in_addr = layer_out_addr[l - 1];  /* chain from previous */
         }
 
-        /* Flush DCache so DMA sees CPU writes to workspace buffers */
-        dcache_flush();
+        /* Resolve Add/Concat branch-B address */
+        uint32_t runtime_add_b_addr = 0;
+        if (residual_src >= 0 && residual_src < (int32_t)num_layers) {
+            runtime_add_b_addr = layer_out_addr[residual_src];
+        } else if (e[33] != 0) {
+            runtime_add_b_addr = e[33];  /* fallback: metadata's ddr_add_b_addr */
+        }
 
-        /* Program CSRs */
-        npu_program_layer(hdr, n_input);
-
-        /* Soft-reset NPU between layers for clean start */
-        if (l > 0) {
+        /* Soft-reset between non-fused layers */
+        if (l > 0 && !(sched & 0x06)) {  /* not FUSE_MID or FUSE_END */
             NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
             for (volatile int d = 0; d < 100; d++) {}
             NPU_REG(REG_IRQ_STATUS) = 0x7;
         }
+
+        /* Program CSRs */
+        npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
+
+        /* Flush DCache so NPU sees all CSR writes */
+        dcache_flush();
+
         /* Start NPU */
         NPU_REG(REG_CTRL) = CTRL_START;
+        dcache_flush();  /* Ensure CTRL_START reaches NPU */
 
         /* Wait for completion */
         int ret = npu_wait_done();
-        if (l == 0) {
-            uint32_t st = NPU_REG(REG_STATUS);
-            uart_puts("  DBG: status=0x");
-            uart_put_hex32(st);
-            uart_puts(" irq=0x");
-            uart_put_hex32(NPU_REG(REG_IRQ_STATUS));
-            uart_putc('\n');
-        }
         if (ret != 0) {
-            uart_puts("  Layer ");
+            uart_puts("  L");
             uart_put_dec(l);
             if (ret == -1) {
                 uart_puts(": ERROR (status=0x");
@@ -374,48 +344,56 @@ static int run_test_case(test_case_t *tc) {
             return -1;
         }
 
-        /* Invalidate DCache so CPU reads DMA-written output from memory */
+        /* Invalidate DCache so CPU reads DMA-written DDR output */
         dcache_flush();
 
-        /* Verify output */
-        volatile uint32_t *out_ptr = (volatile uint32_t *)NPU_OUTPUT_BASE;
-        int layer_err = 0;
-        for (uint32_t i = 0; i < n_output; i++) {
-            if (out_ptr[i] != golden[i]) {
-                if (layer_err < 3) {
-                    uart_puts("  L");
-                    uart_put_dec(l);
-                    uart_puts(" word[");
-                    uart_put_dec(i);
-                    uart_puts("]: exp=0x");
-                    uart_put_hex32(golden[i]);
-                    uart_puts(" got=0x");
-                    uart_put_hex32(out_ptr[i]);
-                    uart_putc('\n');
+        /* Verify output: compare DDR at ddr_out_addr vs golden */
+        uint32_t n_output = e[3];
+        if (n_output > 0) {
+            const uint32_t *golden = cursor + LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2];
+            volatile const uint32_t *out_ptr = (volatile const uint32_t *)(uintptr_t)e[31];
+            int layer_err = 0;
+            for (uint32_t i = 0; i < n_output; i++) {
+                if (out_ptr[i] != golden[i]) {
+                    if (layer_err < 3) {
+                        uart_puts("  L");
+                        uart_put_dec(l);
+                        uart_puts(" w[");
+                        uart_put_dec(i);
+                        uart_puts("]: exp=0x");
+                        uart_put_hex32(golden[i]);
+                        uart_puts(" got=0x");
+                        uart_put_hex32(out_ptr[i]);
+                        uart_putc('\n');
+                    }
+                    layer_err++;
                 }
-                layer_err++;
             }
-        }
 
-        if (layer_err == 0) {
-            uart_puts("  Layer ");
-            uart_put_dec(l);
-            uart_puts(": PASS (");
-            uart_put_dec(n_output);
-            uart_puts(" words)\n");
+            if (layer_err == 0) {
+                uart_puts("  L");
+                uart_put_dec(l);
+                uart_puts(": PASS (");
+                uart_put_dec(n_output);
+                uart_puts(" words)\n");
+            } else {
+                uart_puts("  L");
+                uart_put_dec(l);
+                uart_puts(": FAIL — ");
+                uart_put_dec(layer_err);
+                uart_puts("/");
+                uart_put_dec(n_output);
+                uart_puts(" mismatches\n");
+                total_err += layer_err;
+            }
         } else {
-            uart_puts("  Layer ");
+            uart_puts("  L");
             uart_put_dec(l);
-            uart_puts(": FAIL — ");
-            uart_put_dec(layer_err);
-            uart_puts(" mismatches\n");
-            total_err += layer_err;
+            uart_puts(": (no golden output, skipped verification)\n");
         }
 
-        /* Move data pointer to next entry */
-        uint32_t hdr_words = LAYER_ENTRY_HDR_SIZE / 4;
-        uint32_t extra = (op_type == 4) ? n_input : 0;  /* Add has input_b */
-        data_ptr = data_ptr + hdr_words + n_wgt + n_param + n_input + n_output + extra;
+        /* Advance cursor */
+        cursor += LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2] + e[3];
     }
 
     return total_err;
@@ -423,11 +401,11 @@ static int run_test_case(test_case_t *tc) {
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Main entry point
- * ═══════════════════════════════════════════════════════════════════ */
+ *  ═══════════════════════════════════════════════════════════════════ */
 void main(void) {
     uart_puts("\n\n");
     uart_puts("========================================\n");
-    uart_puts("  Open-NPU SoC — Multi-Layer E2E Test\n");
+    uart_puts("  Open-NPU SoC — Chained Model Inference\n");
     uart_puts("========================================\n\n");
 
     /* Read NPU version */
@@ -447,284 +425,39 @@ void main(void) {
 
     int global_err = 0;
 
-    /* ── Test 1: INT8 MobileNetV2-Tiny ── */
-    uart_puts("\n[TEST 1/25] INT8 MobileNetV2-Tiny (10 layers)\n");
-    test_case_t tc_int8 = { BLOB_INT8_BASE, "INT8", 0 };
-    int ret_int8 = run_test_case(&tc_int8);
-    if (ret_int8 < 0) {
-        uart_puts("  TEST ABORTED\n");
-        global_err++;
-    } else if (ret_int8 > 0) {
-        uart_puts("  INT8: ");
-        uart_put_dec(ret_int8);
-        uart_puts(" mismatches — FAIL\n");
-        global_err++;
-    } else {
-        uart_puts("  INT8: ALL ");
-        uart_put_dec(tc_int8.num_layers);
-        uart_puts(" LAYERS PASSED ✓\n");
-    }
+    /* Run selected model */
+#if defined(RUN_MODEL_A)
+    test_case_t tc = { BLOB_MODEL_BASE, "model_a (MobileNetV2 INT16, 63 layers)" };
+#elif defined(RUN_MODEL_B)
+    test_case_t tc = { BLOB_MODEL_BASE, "model_b (ResNet-18 CIFAR INT16, 25 layers)" };
+#elif defined(RUN_MODEL_C)
+    test_case_t tc = { BLOB_MODEL_BASE, "model_c (YOLO-Tiny INT16, 17 layers)" };
+#elif defined(RUN_MODEL_D)
+    test_case_t tc = { BLOB_MODEL_BASE, "model_d (Palm Vein INT16, 24 layers)" };
+#else
+    uart_puts("ERROR: No model selected. Compile with -DRUN_MODEL_X\n");
+    while (1) {}
+#endif
 
-    /* ── Test 2: INT16 MobileNetV2-Tiny ── */
-    uart_puts("\n[TEST 2/25] INT16 MobileNetV2-Tiny (10 layers)\n");
-    test_case_t tc_int16 = { BLOB_INT16_BASE, "INT16", 0 };
-    int ret_int16 = run_test_case(&tc_int16);
-    if (ret_int16 < 0) {
-        uart_puts("  TEST ABORTED\n");
+    int ret = run_chained_model(&tc);
+    if (ret < 0) {
+        uart_puts("\n  MODEL ABORTED\n");
         global_err++;
-    } else if (ret_int16 > 0) {
-        uart_puts("  INT16: ");
-        uart_put_dec(ret_int16);
-        uart_puts(" mismatches — FAIL\n");
+    } else if (ret > 0) {
+        uart_puts("\n  FAIL — ");
+        uart_put_dec(ret);
+        uart_puts(" total mismatches\n");
         global_err++;
     } else {
-        uart_puts("  INT16: ALL ");
-        uart_put_dec(tc_int16.num_layers);
-        uart_puts(" LAYERS PASSED ✓\n");
+        uart_puts("\n  ALL LAYERS PASSED\n");
     }
 
-    /* ── Pooling operator tests ── */
-    {
-        uart_puts("\n[TEST 3/25] Pool Max INT8\n");
-        test_case_t tc = { BLOB_POOL_MAX_INT8_BASE, "Pool Max INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 4/25] Pool Avg INT8\n");
-        test_case_t tc = { BLOB_POOL_AVG_INT8_BASE, "Pool Avg INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 5/25] Pool Global INT8\n");
-        test_case_t tc = { BLOB_POOL_GLOBAL_INT8_BASE, "Pool Global INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 6/25] Pool Max INT16\n");
-        test_case_t tc = { BLOB_POOL_MAX_INT16_BASE, "Pool Max INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 7/25] Pool Avg INT16\n");
-        test_case_t tc = { BLOB_POOL_AVG_INT16_BASE, "Pool Avg INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 8/25] Pool Global INT16\n");
-        test_case_t tc = { BLOB_POOL_GLOBAL_INT16_BASE, "Pool Global INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    /* ── Resize operator tests ── */
-    {
-        uart_puts("\n[TEST 9/25] Resize Nearest INT8\n");
-        test_case_t tc = { BLOB_RESIZE_NEAREST_INT8_BASE, "Resize Nearest INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 10/25] Resize Bilinear INT16\n");
-        test_case_t tc = { BLOB_RESIZE_BILINEAR_INT16_BASE, "Resize Bilinear INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 11/25] Resize Nearest INT16\n");
-        test_case_t tc = { BLOB_RESIZE_NEAREST_INT16_BASE, "Resize Nearest INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    /* ── Deconv operator tests ── */
-    {
-        uart_puts("\n[TEST 12/25] Deconv INT8\n");
-        test_case_t tc = { BLOB_DECONV_INT8_BASE, "Deconv INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 13/25] Deconv INT16\n");
-        test_case_t tc = { BLOB_DECONV_INT16_BASE, "Deconv INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    /* ── Concat operator tests ── */
-    {
-        uart_puts("\n[TEST 14/25] Concat INT8\n");
-        test_case_t tc = { BLOB_CONCAT_INT8_BASE, "Concat INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 15/25] Concat INT16\n");
-        test_case_t tc = { BLOB_CONCAT_INT16_BASE, "Concat INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    /* ── Add operator tests ── */
-    {
-        uart_puts("\n[TEST 16/25] Eltwise Add INT8\n");
-        test_case_t tc = { BLOB_ADD_INT8_BASE, "Add INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 17/25] Eltwise Add INT16\n");
-        test_case_t tc = { BLOB_ADD_INT16_BASE, "Add INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    /* ── DWConv operator tests ── */
-    {
-        uart_puts("\n[TEST 18/25] DWConv INT8 (8x8x8 stride-1)\n");
-        test_case_t tc = { BLOB_DWCONV_INT8_BASE, "DWConv INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 19/25] DWConv INT16 (8x8x8 stride-2)\n");
-        test_case_t tc = { BLOB_DWCONV_INT16_BASE, "DWConv INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    /* ── FC operator tests ── */
-    {
-        uart_puts("\n[TEST 20/25] FC INT8 (1x1x8 -> 1x1x4)\n");
-        test_case_t tc = { BLOB_FC_INT8_BASE, "FC INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 21/25] FC INT16 (1x1x8 -> 1x1x4)\n");
-        test_case_t tc = { BLOB_FC_INT16_BASE, "FC INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    /* ── Conv2D operator tests ── */
-    {
-        uart_puts("\n[TEST 22/25] Conv2D INT8 (8x8x8 -> 8x8x4, 3x3 s1 p1)\n");
-        test_case_t tc = { BLOB_CONV2D_INT8_BASE, "Conv2D INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    {
-        uart_puts("\n[TEST 23/25] Conv2D INT16 (8x8x8 -> 4x4x4, 3x3 s2 p1)\n");
-        test_case_t tc = { BLOB_CONV2D_INT16_BASE, "Conv2D INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) { uart_puts("  FAIL\n"); global_err++; }
-        else { uart_puts("  PASS ✓\n"); }
-    }
-
-    /* ── AllOps-Mini full model (18 layers, all 7 operators) ── */
-    {
-        uart_puts("\n[TEST 24/25] AllOps-Mini INT8 (18 layers)\n");
-        test_case_t tc = { BLOB_ALLOPS_INT8_BASE, "AllOps-Mini INT8", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) {
-            uart_puts("  FAIL — ");
-            uart_put_dec(ret);
-            uart_puts(" mismatches\n");
-            global_err++;
-        }
-        else {
-            uart_puts("  AllOps-Mini INT8: ALL ");
-            uart_put_dec(tc.num_layers);
-            uart_puts(" LAYERS PASSED ✓\n");
-        }
-    }
-
-    {
-        uart_puts("\n[TEST 25/25] AllOps-Mini INT16 (18 layers)\n");
-        test_case_t tc = { BLOB_ALLOPS_INT16_BASE, "AllOps-Mini INT16", 0 };
-        int ret = run_test_case(&tc);
-        if (ret < 0) { uart_puts("  TEST ABORTED\n"); global_err++; }
-        else if (ret > 0) {
-            uart_puts("  FAIL — ");
-            uart_put_dec(ret);
-            uart_puts(" mismatches\n");
-            global_err++;
-        }
-        else {
-            uart_puts("  AllOps-Mini INT16: ALL ");
-            uart_put_dec(tc.num_layers);
-            uart_puts(" LAYERS PASSED ✓\n");
-        }
-    }
-
-    /* ── Final result ── */
+    /* Final result */
     uart_puts("\n========================================\n");
     if (global_err == 0) {
-        uart_puts("  RESULT: ALL TESTS PASSED ✓\n");
+        uart_puts("  RESULT: PASS\n");
     } else {
-        uart_puts("  RESULT: ");
-        uart_put_dec(global_err);
-        uart_puts(" TEST(S) FAILED ✗\n");
+        uart_puts("  RESULT: FAIL\n");
     }
     uart_puts("========================================\n");
 
