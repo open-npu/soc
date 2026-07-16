@@ -115,6 +115,12 @@ static inline void dcache_flush(void) {
     asm volatile(".word 0x500F" : : : "memory");
 }
 
+#define NPU_WGT_BASE     0x40030000  /* workspace for wgt (64KB) */
+#define NPU_PARAM_BASE   0x40040000  /* workspace for param (64KB) */
+#define NPU_INPUT_BASE   0x40050000  /* workspace for input (64KB) */
+#define NPU_OUTPUT_BASE  0x40060000  /* workspace for output (64KB) */
+#define NPU_ADD_B_BASE   0x40070000  /* workspace for add_b (64KB) */
+
 /* Provide memcpy to satisfy compiler-generated calls */
 __attribute__((noinline))
 void *memcpy(void *dst, const void *src, uint32_t n) {
@@ -123,6 +129,13 @@ void *memcpy(void *dst, const void *src, uint32_t n) {
     for (uint32_t i = 0; i < n; i++)
         d[i] = s[i];
     return dst;
+}
+
+__attribute__((noinline))
+static void memcpy_32(uint32_t dst, const uint32_t *src, uint32_t n_words) {
+    volatile uint32_t *d = (volatile uint32_t *)dst;
+    for (uint32_t i = 0; i < n_words; i++)
+        d[i] = src[i];
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -319,11 +332,34 @@ static int run_chained_model(test_case_t *tc) {
             NPU_REG(REG_IRQ_STATUS) = 0x7;
         }
 
-        /* Program CSRs */
-        npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
+        /* For layer 0: copy input/wgt/param to workspace (like old firmware)
+         * to test if the issue is DMA addressing vs workspace */
+        if (l == 0) {
+            /* Copy wgt to workspace */
+            const uint32_t *wgt_src = cursor + LAYER_ENTRY_HDR_WORDS;
+            memcpy_32(NPU_WGT_BASE, wgt_src, e[0]);
+            /* Copy param to workspace */
+            const uint32_t *param_src = wgt_src + e[0];
+            memcpy_32(NPU_PARAM_BASE, param_src, e[1]);
+            /* Copy input to workspace */
+            const uint32_t *in_src = param_src + e[1];
+            memcpy_32(NPU_INPUT_BASE, in_src, e[2]);
+            dcache_flush();
 
-        /* Flush DCache so NPU sees all CSR writes */
-        dcache_flush();
+            /* Override DMA addresses to workspace */
+            npu_program_layer(e, NPU_INPUT_BASE, runtime_add_b_addr, 0);
+            /* Re-program wgt/param/out to workspace */
+            NPU_REG(REG_DMA_WGT_ADDR)   = NPU_WGT_BASE;
+            NPU_REG(REG_DMA_PARAM_ADDR) = NPU_PARAM_BASE;
+            NPU_REG(REG_DMA_OUT_ADDR)   = NPU_OUTPUT_BASE;
+            dcache_flush();
+
+            uart_puts("  DBG: using workspace mode\n");
+        } else {
+            /* Program CSRs with DDR addresses */
+            npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
+            dcache_flush();
+        }
 
         /* Start NPU */
         NPU_REG(REG_CTRL) = CTRL_START;
@@ -351,7 +387,13 @@ static int run_chained_model(test_case_t *tc) {
         uint32_t n_output = e[3];
         if (n_output > 0) {
             const uint32_t *golden = cursor + LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2];
-            volatile const uint32_t *out_ptr = (volatile const uint32_t *)(uintptr_t)e[31];
+            /* For L0 workspace mode, read from NPU_OUTPUT_BASE */
+            volatile const uint32_t *out_ptr;
+            if (l == 0) {
+                out_ptr = (volatile const uint32_t *)NPU_OUTPUT_BASE;
+            } else {
+                out_ptr = (volatile const uint32_t *)(uintptr_t)e[31];
+            }
             int layer_err = 0;
             for (uint32_t i = 0; i < n_output; i++) {
                 if (out_ptr[i] != golden[i]) {
