@@ -115,13 +115,12 @@ def main():
     # (main_ram is initialized via $readmemh, ROM via separate sim_rom.init)
 
     # 2. Blob header at BLOB_BASE
-    blob_offset = (BLOB_BASE // 4) & 0xFFFFFF  # array index for main_ram
+    blob_offset = ((BLOB_BASE - MAIN_RAM_BASE) // 4) & 0xFFFFFF  # array index for main_ram
     for i, w in enumerate(td_words[:3]):  # 3-word blob header
         ram[blob_offset + i] = w
 
     # 3. Scatter layer payloads to DDR addresses
-    #    LiteX sram1_adr = wb_word_addr[23:0] = (byte_addr/4) & 0xFFFFFF
-    #    So main_ram array index = (ddr_byte_addr // 4) & 0xFFFFFF
+    #    main_ram array index = (ddr_byte_addr - MAIN_RAM_BASE) // 4
     for l, layer in enumerate(layers):
         hdr = layer['header']
         n_wgt = hdr[0]
@@ -131,25 +130,25 @@ def main():
 
         # Weights at ddr_wgt_addr
         if layer['ddr_wgt'] and n_wgt > 0:
-            base = (layer['ddr_wgt'] // 4) & 0xFFFFFF
+            base = ((layer['ddr_wgt'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
             for i, w in enumerate(layer['wgt']):
                 ram[base + i] = w
 
         # Params at ddr_param_addr
         if layer['ddr_param'] and n_param > 0:
-            base = (layer['ddr_param'] // 4) & 0xFFFFFF
+            base = ((layer['ddr_param'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
             for i, w in enumerate(layer['param']):
                 ram[base + i] = w
 
         # Input at ddr_in_addr (layer 0 only)
         if layer['ddr_in'] and n_input > 0:
-            base = (layer['ddr_in'] // 4) & 0xFFFFFF
+            base = ((layer['ddr_in'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
             for i, w in enumerate(layer['input']):
                 ram[base + i] = w
 
         # Golden output at ddr_out_addr
         if layer['ddr_out'] and n_output > 0:
-            base = (layer['ddr_out'] // 4) & 0xFFFFFF
+            base = ((layer['ddr_out'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
             for i, w in enumerate(layer['output']):
                 ram[base + i] = w
 
