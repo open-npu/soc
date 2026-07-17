@@ -332,30 +332,14 @@ static int run_chained_model(test_case_t *tc) {
             NPU_REG(REG_IRQ_STATUS) = 0x7;
         }
 
-        /* For L0: use workspace mode + disable PTS to isolate the issue */
-        uint32_t l0_in_workspace = 0x40050000;
+        /* For L0: disable DB_EN (no double buffering) to test if DB_EN
+         * prefetch is the issue. Keep tiling, but sched_ctrl=0 (no DB_EN) */
         if (l == 0) {
-            const uint32_t *payload_l0 = cursor + LAYER_ENTRY_HDR_WORDS;
-            memcpy_32(NPU_WGT_BASE, payload_l0, e[0]);
-            payload_l0 += e[0];
-            memcpy_32(NPU_PARAM_BASE, payload_l0, e[1]);
-            payload_l0 += e[1];
-            memcpy_32(l0_in_workspace, payload_l0, e[2]);
+            npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
+            /* Override: disable DB_EN and PTS */
+            NPU_REG(REG_DMA_CTRL) = 0x00;  /* no DB_EN, no PTS */
             dcache_flush();
-
-            npu_program_layer(e, l0_in_workspace, runtime_add_b_addr, 0);
-            NPU_REG(REG_DMA_WGT_ADDR)   = NPU_WGT_BASE;
-            NPU_REG(REG_DMA_PARAM_ADDR) = NPU_PARAM_BASE;
-            /* Disable tiling completely: TILE_CFG=0, TILE_COUNT=1, DMA_CTRL=0 */
-            NPU_REG(REG_TILE_CFG)   = 0;
-            NPU_REG(REG_TILE_COUNT) = 1 | (1 << 16);
-            NPU_REG(REG_DMA_CTRL)   = 0;
-            NPU_REG(REG_DMA_STORE_MODE)    = 0;
-            NPU_REG(REG_DMA_TILE_IN_SIZE)  = 0;
-            NPU_REG(REG_DMA_TILE_OUT_SIZE) = 0;
-            NPU_REG(REG_SRAM_BASE) = (e[2] << 16);  /* out_base = n_input_words */
-            dcache_flush();
-            uart_puts("  DBG: L0 workspace mode, tiling disabled\n");
+            uart_puts("  DBG: L0 DB_EN disabled\n");
         } else {
             npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
             dcache_flush();
