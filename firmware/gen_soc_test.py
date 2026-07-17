@@ -107,7 +107,7 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         ddr_wgt = remap_ddr(m.get('ddr_wgt_addr', 0))
         ddr_param = remap_ddr(m.get('ddr_param_addr', 0))
         ddr_out = remap_ddr(m.get('ddr_out_addr', 0))
-        ddr_in = remap_ddr(m.get('ddr_in_addr', 0)) if i == 0 else 0
+        ddr_in = remap_ddr(m.get('ddr_in_addr', 0)) if (i == 0 or i == standalone_layer) else 0
         ddr_add_b = remap_ddr(m.get('ddr_add_b_addr', 0))
 
         # Pack fields
@@ -115,8 +115,7 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         out_hw = m['out_h'] | (m['out_w'] << 16)
         kernel_dil = m['kernel_h'] | (m['kernel_w'] << 8)
         stride = m['stride_h'] | (m['stride_w'] << 8)
-        padding = m.get('pad_top', 0) | (m.get('pad_top', 0) << 8) | \
-                  (m.get('pad_left', 0) << 16) | (m.get('pad_left', 0) << 24)
+        padding = m.get('pad_top', 0) | (m.get('pad_left', 0) << 8)
 
         tile_cfg = m.get('tile_h', 0) | (m.get('tile_w', 0) << 16)
         tile_count = m.get('tile_num_h', 1) | (m.get('tile_num_w', 1) << 16)
