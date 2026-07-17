@@ -115,11 +115,11 @@ static inline void dcache_flush(void) {
     asm volatile(".word 0x500F" : : : "memory");
 }
 
-#define NPU_WGT_BASE     0x40030000  /* workspace for wgt (64KB) */
-#define NPU_PARAM_BASE   0x40040000  /* workspace for param (64KB) */
-#define NPU_INPUT_BASE   0x40050000  /* workspace for input (64KB) */
-#define NPU_OUTPUT_BASE  0x40060000  /* workspace for output (64KB) */
-#define NPU_ADD_B_BASE   0x40070000  /* workspace for add_b (64KB) */
+#define NPU_WGT_BASE     0x4002C000  /* workspace for wgt (16KB) */
+#define NPU_PARAM_BASE   0x40030000  /* workspace for param (16KB) */
+#define NPU_INPUT_BASE   0x40034000  /* workspace for input (16KB) */
+#define NPU_OUTPUT_BASE  0x40038000  /* workspace for output (16KB) */
+#define NPU_ADD_B_BASE   0x4003C000  /* workspace for add_b (16KB) */
 
 /* Provide memcpy to satisfy compiler-generated calls */
 __attribute__((noinline))
@@ -332,31 +332,31 @@ static int run_chained_model(test_case_t *tc) {
             NPU_REG(REG_IRQ_STATUS) = 0x7;
         }
 
-        /* For layer 0: copy input/wgt/param to workspace (like old firmware)
-         * to test if the issue is DMA addressing vs workspace */
+        /* For L0: use workspace mode + disable PTS to isolate the issue */
+        uint32_t l0_in_workspace = 0x40050000;
         if (l == 0) {
-            /* Copy wgt to workspace */
-            const uint32_t *wgt_src = cursor + LAYER_ENTRY_HDR_WORDS;
-            memcpy_32(NPU_WGT_BASE, wgt_src, e[0]);
-            /* Copy param to workspace */
-            const uint32_t *param_src = wgt_src + e[0];
-            memcpy_32(NPU_PARAM_BASE, param_src, e[1]);
-            /* Copy input to workspace */
-            const uint32_t *in_src = param_src + e[1];
-            memcpy_32(NPU_INPUT_BASE, in_src, e[2]);
+            const uint32_t *payload_l0 = cursor + LAYER_ENTRY_HDR_WORDS;
+            memcpy_32(NPU_WGT_BASE, payload_l0, e[0]);
+            payload_l0 += e[0];
+            memcpy_32(NPU_PARAM_BASE, payload_l0, e[1]);
+            payload_l0 += e[1];
+            memcpy_32(l0_in_workspace, payload_l0, e[2]);
             dcache_flush();
 
-            /* Override DMA addresses to workspace */
-            npu_program_layer(e, NPU_INPUT_BASE, runtime_add_b_addr, 0);
-            /* Re-program wgt/param/out to workspace */
+            npu_program_layer(e, l0_in_workspace, runtime_add_b_addr, 0);
             NPU_REG(REG_DMA_WGT_ADDR)   = NPU_WGT_BASE;
             NPU_REG(REG_DMA_PARAM_ADDR) = NPU_PARAM_BASE;
-            NPU_REG(REG_DMA_OUT_ADDR)   = NPU_OUTPUT_BASE;
+            /* Disable tiling completely: TILE_CFG=0, TILE_COUNT=1, DMA_CTRL=0 */
+            NPU_REG(REG_TILE_CFG)   = 0;
+            NPU_REG(REG_TILE_COUNT) = 1 | (1 << 16);
+            NPU_REG(REG_DMA_CTRL)   = 0;
+            NPU_REG(REG_DMA_STORE_MODE)    = 0;
+            NPU_REG(REG_DMA_TILE_IN_SIZE)  = 0;
+            NPU_REG(REG_DMA_TILE_OUT_SIZE) = 0;
+            NPU_REG(REG_SRAM_BASE) = (e[2] << 16);  /* out_base = n_input_words */
             dcache_flush();
-
-            uart_puts("  DBG: using workspace mode\n");
+            uart_puts("  DBG: L0 workspace mode, tiling disabled\n");
         } else {
-            /* Program CSRs with DDR addresses */
             npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
             dcache_flush();
         }
@@ -387,12 +387,22 @@ static int run_chained_model(test_case_t *tc) {
         uint32_t n_output = e[3];
         if (n_output > 0) {
             const uint32_t *golden = cursor + LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2];
-            /* For L0 workspace mode, read from NPU_OUTPUT_BASE */
-            volatile const uint32_t *out_ptr;
+            volatile const uint32_t *out_ptr = (volatile const uint32_t *)(uintptr_t)e[31];
+
+            /* Debug: for layer 0, print first 10 output words vs golden */
             if (l == 0) {
-                out_ptr = (volatile const uint32_t *)NPU_OUTPUT_BASE;
-            } else {
-                out_ptr = (volatile const uint32_t *)(uintptr_t)e[31];
+                uart_puts("  DBG: out_addr=0x");
+                uart_put_hex32(e[31]);
+                uart_puts("\n");
+                for (int dbg = 0; dbg < 10 && dbg < (int)n_output; dbg++) {
+                    uart_puts("  w[");
+                    uart_put_dec(dbg);
+                    uart_puts("] exp=0x");
+                    uart_put_hex32(golden[dbg]);
+                    uart_puts(" got=0x");
+                    uart_put_hex32(out_ptr[dbg]);
+                    uart_puts("\n");
+                }
             }
             int layer_err = 0;
             for (uint32_t i = 0; i < n_output; i++) {
@@ -467,7 +477,128 @@ void main(void) {
 
     int global_err = 0;
 
-    /* Run selected model */
+#ifdef RUN_FC_TEST
+    /* Standalone FC test: run L24 only, using workspace mode (no tiling, no DDR chaining) */
+    uart_puts("\n[FC TEST] Running L24 standalone (workspace mode)\n");
+    {
+        /* Access blob at BLOB_MODEL_BASE */
+        volatile const uint32_t *blob_fc = (volatile const uint32_t *)(uintptr_t)BLOB_MODEL_BASE;
+        /* Find L24 in blob */
+        const uint32_t *cursor_fc = (const uint32_t *)(blob_fc + 3);
+        for (uint32_t l = 0; l < 24; l++) {
+            cursor_fc += LAYER_ENTRY_HDR_WORDS + cursor_fc[0] + cursor_fc[1] + cursor_fc[2] + cursor_fc[3];
+        }
+        const uint32_t *e24 = cursor_fc;
+
+        /* Debug: print L24 header fields */
+        uart_puts("  L24 hdr: op=");
+        uart_put_dec(e24[4]);
+        uart_puts(" n_wgt=");
+        uart_put_dec(e24[0]);
+        uart_puts(" n_param=");
+        uart_put_dec(e24[1]);
+        uart_puts(" n_in=");
+        uart_put_dec(e24[2]);
+        uart_puts(" n_out=");
+        uart_put_dec(e24[3]);
+        uart_puts(" post_ctrl=0x");
+        uart_put_hex32(e24[13]);
+        uart_puts(" param_cnt=");
+        uart_put_dec(e24[14]);
+        uart_puts(" clamp=0x");
+        uart_put_hex32(e24[27]);
+        uart_puts("\n");
+
+        /* Copy wgt, param, input to workspace */
+        const uint32_t *payload = cursor_fc + LAYER_ENTRY_HDR_WORDS;
+        memcpy_32(NPU_WGT_BASE, payload, e24[0]);
+        payload += e24[0];
+        memcpy_32(NPU_PARAM_BASE, payload, e24[1]);
+        payload += e24[1];
+        memcpy_32(NPU_INPUT_BASE, payload, e24[2]);
+        payload += e24[2];
+        const uint32_t *golden24 = payload;
+        dcache_flush();
+
+        /* Debug: verify workspace data matches golden */
+        uart_puts("  DBG: wgt[0]=0x");
+        uart_put_hex32(*(volatile uint32_t*)NPU_WGT_BASE);
+        uart_puts(" in[0]=0x");
+        uart_put_hex32(*(volatile uint32_t*)NPU_INPUT_BASE);
+        uart_puts(" param[0]=0x");
+        uart_put_hex32(*(volatile uint32_t*)NPU_PARAM_BASE);
+        uart_puts(" golden[0]=0x");
+        uart_put_hex32(golden24[0]);
+        uart_puts("\n");
+
+        /* Program NPU with workspace addresses, no tiling */
+        npu_reset();
+        NPU_REG(REG_LAYER_MODE) = (e24[4] & 0xF) | ((e24[5] & 1) << 4) | ((e24[28] & 0xFFFF) << 8);
+        NPU_REG(REG_IN_DIM_HW)  = e24[6];
+        NPU_REG(REG_IN_DIM_C)   = e24[7];
+        NPU_REG(REG_OUT_DIM_HW) = e24[8];
+        NPU_REG(REG_OUT_DIM_C)  = e24[9];
+        NPU_REG(REG_KERNEL_SIZE) = e24[10] & 0xFFFF;
+        NPU_REG(REG_STRIDE)      = e24[11];
+        NPU_REG(REG_PADDING)     = e24[12];
+        NPU_REG(REG_TILE_CFG)   = 0;
+        NPU_REG(REG_TILE_COUNT) = 1 | (1 << 16);
+        NPU_REG(REG_SRAM_BASE)  = (e24[2] << 16);  /* out_base = n_input_words */
+        NPU_REG(REG_DMA_IN_ADDR)    = NPU_INPUT_BASE;
+        NPU_REG(REG_DMA_OUT_ADDR)   = NPU_OUTPUT_BASE;
+        NPU_REG(REG_DMA_WGT_ADDR)   = NPU_WGT_BASE;
+        NPU_REG(REG_DMA_PARAM_ADDR) = NPU_PARAM_BASE;
+        NPU_REG(REG_DMA_IN_SIZE)  = e24[15];
+        NPU_REG(REG_DMA_WGT_SIZE) = e24[16];
+        NPU_REG(REG_DMA_OUT_SIZE) = e24[17];
+        NPU_REG(REG_DMA_IN_STRIDE)  = 0;
+        NPU_REG(REG_DMA_OUT_STRIDE) = 0;
+        NPU_REG(REG_DMA_CTRL)       = 0;
+        NPU_REG(REG_DMA_WGT_PER_OC) = 0;
+        NPU_REG(REG_POST_CTRL)      = e24[13];
+        NPU_REG(REG_POST_PARAM_CNT) = e24[14];
+        NPU_REG(REG_POST_CLAMP)     = e24[27];
+        dcache_flush();
+
+        NPU_REG(REG_CTRL) = CTRL_START;
+        dcache_flush();
+
+        int ret = npu_wait_done();
+        if (ret != 0) {
+            uart_puts("  FC: ERROR/TIMEOUT\n");
+            global_err++;
+        } else {
+            dcache_flush();
+            volatile uint32_t *out = (volatile uint32_t *)NPU_OUTPUT_BASE;
+            int err = 0;
+            for (uint32_t i = 0; i < e24[3]; i++) {
+                if (out[i] != golden24[i]) {
+                    if (err < 5) {
+                        uart_puts("  w[");
+                        uart_put_dec(i);
+                        uart_puts("] exp=0x");
+                        uart_put_hex32(golden24[i]);
+                        uart_puts(" got=0x");
+                        uart_put_hex32(out[i]);
+                        uart_puts("\n");
+                    }
+                    err++;
+                }
+            }
+            if (err == 0) {
+                uart_puts("  FC: PASS (");
+                uart_put_dec(e24[3]);
+                uart_puts(" words)\n");
+            } else {
+                uart_puts("  FC: FAIL — ");
+                uart_put_dec(err);
+                uart_puts(" mismatches\n");
+                global_err++;
+            }
+        }
+    }
+#else
+    /* Run selected model (chained inference) */
 #if defined(RUN_MODEL_A)
     test_case_t tc = { BLOB_MODEL_BASE, "model_a (MobileNetV2 INT16, 63 layers)" };
 #elif defined(RUN_MODEL_B)
@@ -493,6 +624,7 @@ void main(void) {
     } else {
         uart_puts("\n  ALL LAYERS PASSED\n");
     }
+#endif /* !RUN_FC_TEST */
 
     /* Final result */
     uart_puts("\n========================================\n");

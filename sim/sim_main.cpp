@@ -31,6 +31,8 @@ int main(int argc, char** argv) {
     uint64_t sim_time = 0;
     uint64_t last_uart_time = 0;
     int uart_bytes = 0;
+    int dma_wr_count = 0;  // Track DMA writes for debug
+    bool layer0_started = false;
 
     printf("[SoC Sim] Starting VexRiscv + NPU SoC simulation...\n");
     printf("[SoC Sim] Reset deasserted, waiting for BIOS UART output...\n");

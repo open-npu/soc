@@ -33,10 +33,11 @@ all: $(TARGET).bin $(TARGET).hex $(MAIN_RAM_INIT)
 
 # Model selection (passed via DEFINES)
 MODEL ?= model_b_int16
+STANDALONE_LAYER ?= -1
 
 # Generate test data header and binary blob together
 $(TEST_DATA_H) $(TEST_DATA_BIN):
-	python3 gen_soc_test.py --model $(MODEL)
+	python3 gen_soc_test.py --model $(MODEL) --standalone-layer $(STANDALONE_LAYER)
 
 %.o: %.c $(TEST_DATA_H)
 	$(CC) $(CFLAGS) -c $< -o $@

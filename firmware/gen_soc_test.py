@@ -80,7 +80,7 @@ def remap_ddr(addr):
     return (addr & 0x0FFFFFFF) + MODEL_DDR_BASE
 
 
-def build_chained_blob(meta, data):
+def build_chained_blob(meta, data, standalone_layer=-1):
     """Build binary blob bytes for chained model inference.
 
     Each layer has 36-word header + wgt + param + input(L0 only) + golden output.
@@ -100,7 +100,7 @@ def build_chained_blob(meta, data):
 
         n_wgt = len(wgt)
         n_param = len(param)
-        n_input = len(inp) if i == 0 else 0  # only layer 0 has inline input
+        n_input = len(inp) if (i == 0 or i == standalone_layer) else 0
         n_output = len(out)
 
         # Remap DDR addresses
@@ -189,7 +189,7 @@ def build_chained_blob(meta, data):
             buf += pack_u32(int(w))
         for w in param:
             buf += pack_u32(int(w))
-        if i == 0:
+        if i == 0 or i == standalone_layer:
             for w in inp:
                 buf += pack_u32(int(w))
         for w in out:
@@ -272,6 +272,8 @@ def main():
     parser.add_argument('--model', required=True,
                         choices=['model_a_int16', 'model_b_int16', 'model_c_int16', 'model_d_int16'],
                         help='Model to generate')
+    parser.add_argument('--standalone-layer', type=int, default=-1,
+                        help='Also pack input data for this layer (for standalone testing)')
     args = parser.parse_args()
 
     print(f"Loading golden data for {args.model}...")
@@ -289,7 +291,7 @@ def main():
     # For now, include all layers; firmware will skip verification for empty output
 
     print(f"Building chained blob...")
-    blob = build_chained_blob(meta, data)
+    blob = build_chained_blob(meta, data, args.standalone_layer)
     print(f"  Blob size: {len(blob)} bytes ({len(blob)/1024/1024:.1f} MB)")
 
     with open(BLOB_FILE, 'wb') as f:
