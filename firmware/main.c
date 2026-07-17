@@ -332,11 +332,8 @@ static int run_chained_model(test_case_t *tc) {
             NPU_REG(REG_IRQ_STATUS) = 0x7;
         }
 
-        /* Disable DB_EN for all layers — DB_EN prefetch causes data corruption
-         * on SoC LiteX bus (multi-cycle latency vs RTL testbench 1-cycle).
-         * Keep tiling, PTS, and FUSE bits. */
+        /* Use original sched_ctrl from metadata (DB_EN + PTS enabled) */
         npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
-        NPU_REG(REG_DMA_CTRL) = e[21] & ~0x01;  /* clear DB_EN bit only */
         dcache_flush();
 
         /* Start NPU */
