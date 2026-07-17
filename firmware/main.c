@@ -453,6 +453,9 @@ void main(void) {
     int global_err = 0;
 
 #ifdef RUN_FC_TEST
+#ifndef STANDALONE_LAYER_VAL
+#define STANDALONE_LAYER_VAL 24
+#endif
     /* Standalone FC test: run L24 only, using workspace mode (no tiling, no DDR chaining) */
     uart_puts("\n[FC TEST] Running L24 standalone (workspace mode)\n");
     {
@@ -460,7 +463,8 @@ void main(void) {
         volatile const uint32_t *blob_fc = (volatile const uint32_t *)(uintptr_t)BLOB_MODEL_BASE;
         /* Find L24 in blob */
         const uint32_t *cursor_fc = (const uint32_t *)(blob_fc + 3);
-        for (uint32_t l = 0; l < 24; l++) {
+        int skip_layers = STANDALONE_LAYER_VAL;
+        for (uint32_t l = 0; l < (uint32_t)skip_layers; l++) {
             cursor_fc += LAYER_ENTRY_HDR_WORDS + cursor_fc[0] + cursor_fc[1] + cursor_fc[2] + cursor_fc[3];
         }
         const uint32_t *e24 = cursor_fc;
@@ -484,55 +488,36 @@ void main(void) {
         uart_put_hex32(e24[27]);
         uart_puts("\n");
 
-        /* Copy wgt, param, input to workspace */
+        /* Always use DDR for wgt/param/output. Copy only input to workspace
+         * if it fits, else use DDR. */
         const uint32_t *payload = cursor_fc + LAYER_ENTRY_HDR_WORDS;
-        memcpy_32(NPU_WGT_BASE, payload, e24[0]);
-        payload += e24[0];
-        memcpy_32(NPU_PARAM_BASE, payload, e24[1]);
-        payload += e24[1];
-        memcpy_32(NPU_INPUT_BASE, payload, e24[2]);
-        payload += e24[2];
-        const uint32_t *golden24 = payload;
+        uint32_t in_addr;
+        if (e24[2] * 4 <= 16384) {
+            memcpy_32(NPU_INPUT_BASE, payload + e24[0] + e24[1], e24[2]);
+            in_addr = NPU_INPUT_BASE;
+        } else {
+            in_addr = e24[32];  /* ddr_in_addr */
+        }
+        uint32_t wgt_addr = e24[29];    /* ddr_wgt_addr */
+        uint32_t param_addr = e24[30];  /* ddr_param_addr */
+        uint32_t out_addr = e24[31];    /* ddr_out_addr */
+        const uint32_t *golden24 = payload + e24[0] + e24[1] + e24[2];
         dcache_flush();
 
-        /* Debug: verify workspace data matches golden */
-        uart_puts("  DBG: wgt[0]=0x");
-        uart_put_hex32(*(volatile uint32_t*)NPU_WGT_BASE);
+        /* Debug */
+        uart_puts("  DBG: wgt_addr=0x");
+        uart_put_hex32(wgt_addr);
         uart_puts(" in[0]=0x");
-        uart_put_hex32(*(volatile uint32_t*)NPU_INPUT_BASE);
-        uart_puts(" param[0]=0x");
-        uart_put_hex32(*(volatile uint32_t*)NPU_PARAM_BASE);
+        uart_put_hex32(*(volatile uint32_t*)in_addr);
         uart_puts(" golden[0]=0x");
         uart_put_hex32(golden24[0]);
         uart_puts("\n");
 
-        /* Program NPU with workspace addresses, no tiling */
+        /* Program NPU — use full npu_program_layer for tiling support */
         npu_reset();
-        NPU_REG(REG_LAYER_MODE) = (e24[4] & 0xF) | ((e24[5] & 1) << 4) | ((e24[28] & 0xFFFF) << 8);
-        NPU_REG(REG_IN_DIM_HW)  = e24[6];
-        NPU_REG(REG_IN_DIM_C)   = e24[7];
-        NPU_REG(REG_OUT_DIM_HW) = e24[8];
-        NPU_REG(REG_OUT_DIM_C)  = e24[9];
-        NPU_REG(REG_KERNEL_SIZE) = e24[10] & 0xFFFF;
-        NPU_REG(REG_STRIDE)      = e24[11];
-        NPU_REG(REG_PADDING)     = e24[12];
-        NPU_REG(REG_TILE_CFG)   = 0;
-        NPU_REG(REG_TILE_COUNT) = 1 | (1 << 16);
-        NPU_REG(REG_SRAM_BASE)  = (e24[2] << 16);  /* out_base = n_input_words */
-        NPU_REG(REG_DMA_IN_ADDR)    = NPU_INPUT_BASE;
-        NPU_REG(REG_DMA_OUT_ADDR)   = NPU_OUTPUT_BASE;
-        NPU_REG(REG_DMA_WGT_ADDR)   = NPU_WGT_BASE;
-        NPU_REG(REG_DMA_PARAM_ADDR) = NPU_PARAM_BASE;
-        NPU_REG(REG_DMA_IN_SIZE)  = e24[15];
-        NPU_REG(REG_DMA_WGT_SIZE) = e24[16];
-        NPU_REG(REG_DMA_OUT_SIZE) = e24[17];
-        NPU_REG(REG_DMA_IN_STRIDE)  = 0;
-        NPU_REG(REG_DMA_OUT_STRIDE) = 0;
-        NPU_REG(REG_DMA_CTRL)       = 0;
-        NPU_REG(REG_DMA_WGT_PER_OC) = 0;
-        NPU_REG(REG_POST_CTRL)      = e24[13];
-        NPU_REG(REG_POST_PARAM_CNT) = e24[14];
-        NPU_REG(REG_POST_CLAMP)     = e24[27];
+        npu_program_layer(e24, in_addr, 0, 0);
+        /* Override output address */
+        NPU_REG(REG_DMA_OUT_ADDR) = out_addr;
         dcache_flush();
 
         NPU_REG(REG_CTRL) = CTRL_START;
@@ -544,7 +529,7 @@ void main(void) {
             global_err++;
         } else {
             dcache_flush();
-            volatile uint32_t *out = (volatile uint32_t *)NPU_OUTPUT_BASE;
+            volatile uint32_t *out = (volatile uint32_t *)out_addr;
             int err = 0;
             for (uint32_t i = 0; i < e24[3]; i++) {
                 if (out[i] != golden24[i]) {
