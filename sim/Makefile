@@ -27,7 +27,6 @@ VERILATOR_FLAGS = --cc --exe -O3 \
     -Wno-UNOPTFLAT -Wno-COMBDLY -Wno-LATCH -Wno-CASEINCOMPLETE \
     --top-module $(VERILOG_TOP) \
     -I$(NPU_INC_DIR) \
-    +define+SYNTHESIS \
     +define+ACC_WIDTH=44
 
 .PHONY: all build run clean generate
