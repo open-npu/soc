@@ -332,18 +332,12 @@ static int run_chained_model(test_case_t *tc) {
             NPU_REG(REG_IRQ_STATUS) = 0x7;
         }
 
-        /* For L0: disable DB_EN (no double buffering) to test if DB_EN
-         * prefetch is the issue. Keep tiling, but sched_ctrl=0 (no DB_EN) */
-        if (l == 0) {
-            npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
-            /* Override: disable DB_EN and PTS */
-            NPU_REG(REG_DMA_CTRL) = 0x00;  /* no DB_EN, no PTS */
-            dcache_flush();
-            uart_puts("  DBG: L0 DB_EN disabled\n");
-        } else {
-            npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
-            dcache_flush();
-        }
+        /* Disable DB_EN for all layers — DB_EN prefetch causes data corruption
+         * on SoC LiteX bus (multi-cycle latency vs RTL testbench 1-cycle).
+         * Keep tiling, PTS, and FUSE bits. */
+        npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
+        NPU_REG(REG_DMA_CTRL) = e[21] & ~0x01;  /* clear DB_EN bit only */
+        dcache_flush();
 
         /* Start NPU */
         NPU_REG(REG_CTRL) = CTRL_START;
@@ -391,17 +385,17 @@ static int run_chained_model(test_case_t *tc) {
             int layer_err = 0;
             for (uint32_t i = 0; i < n_output; i++) {
                 if (out_ptr[i] != golden[i]) {
-                    if (layer_err < 3) {
-                        uart_puts("  L");
-                        uart_put_dec(l);
-                        uart_puts(" w[");
-                        uart_put_dec(i);
-                        uart_puts("]: exp=0x");
-                        uart_put_hex32(golden[i]);
-                        uart_puts(" got=0x");
-                        uart_put_hex32(out_ptr[i]);
-                        uart_putc('\n');
-                    }
+            if (layer_err < 10) {
+                    uart_puts("  L");
+                    uart_put_dec(l);
+                    uart_puts(" w[");
+                    uart_put_dec(i);
+                    uart_puts("]: exp=0x");
+                    uart_put_hex32(golden[i]);
+                    uart_puts(" got=0x");
+                    uart_put_hex32(out_ptr[i]);
+                    uart_putc('\n');
+                }
                     layer_err++;
                 }
             }
