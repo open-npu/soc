@@ -237,8 +237,14 @@ static void npu_program_layer(const uint32_t *e,
         NPU_REG(REG_DMA_ROW_CFG)       = e[25];
     }
 
-    /* Strides (contiguous) */
-    NPU_REG(REG_DMA_IN_STRIDE)  = 0;
+    /* Strides: in_stride = in_w * in_c * elem_bytes for 2D tiled load (chain mode) */
+    {
+        uint32_t in_w = e[6] >> 16;
+        uint32_t in_c = e[7];
+        uint32_t eb = (e[5] & 1) ? 2 : 1;
+        /* Set in_stride for tiled layers (non-zero enables 2D DMA load) */
+        NPU_REG(REG_DMA_IN_STRIDE) = (e[19] != 0) ? (in_w * in_c * eb) : 0;
+    }
     NPU_REG(REG_DMA_OUT_STRIDE) = 0;
 
     /* DMA control: sched_ctrl (DB_EN/FUSE/PTS bits from metadata) */
