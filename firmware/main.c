@@ -246,7 +246,8 @@ static void npu_program_layer(const uint32_t *e,
          * Layer 0 input is pre-packed contiguous → in_stride=0 (1D mode).
          * Chain input from previous layer → in_stride=NHWC row width. */
         int is_nhwc_input = (runtime_in_addr != e[32]);  /* not layer-0 packed data */
-        NPU_REG(REG_DMA_IN_STRIDE) = (e[19] != 0 && is_nhwc_input) ? (in_w * in_c * eb) : 0;
+        uint32_t in_stride_val = (e[19] != 0 && is_nhwc_input) ? (in_w * in_c * eb) : 0;
+        NPU_REG(REG_DMA_IN_STRIDE) = in_stride_val;
     }
     NPU_REG(REG_DMA_OUT_STRIDE) = 0;
 
@@ -344,6 +345,13 @@ static int run_chained_model(test_case_t *tc) {
         /* Use original sched_ctrl from metadata (DB_EN + PTS enabled) */
         npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
         dcache_flush();
+        if (l < 3) {
+            uart_puts("  DBG L"); uart_put_dec(l);
+            uart_puts(": in_addr=0x"); uart_put_hex32(runtime_in_addr);
+            uart_puts(" e32=0x"); uart_put_hex32(e[32]);
+            uart_puts(" in_stride=0x"); uart_put_hex32(NPU_REG(0x110));
+            uart_puts("\n");
+        }
 
         /* Start NPU */
         NPU_REG(REG_CTRL) = CTRL_START;
