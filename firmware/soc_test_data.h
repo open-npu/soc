@@ -5,7 +5,7 @@
 
 /* Model: model_b_int16 */
 #define BLOB_MODEL_BASE  0x40010000
-#define BLOB_MODEL_SIZE  2104468
+#define BLOB_MODEL_SIZE  1513108
 
 /* Per-layer blob entry header (36 uint32 words = 144 bytes) */
 typedef struct {
