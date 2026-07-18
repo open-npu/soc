@@ -242,8 +242,11 @@ static void npu_program_layer(const uint32_t *e,
         uint32_t in_w = e[6] >> 16;
         uint32_t in_c = e[7];
         uint32_t eb = (e[5] & 1) ? 2 : 1;
-        /* Set in_stride for tiled layers (non-zero enables 2D DMA load) */
-        NPU_REG(REG_DMA_IN_STRIDE) = (e[19] != 0) ? (in_w * in_c * eb) : 0;
+        /* Set in_stride for tiled layers when input is NHWC (chain mode).
+         * Layer 0 input is pre-packed contiguous → in_stride=0 (1D mode).
+         * Chain input from previous layer → in_stride=NHWC row width. */
+        int is_nhwc_input = (runtime_in_addr != e[32]);  /* not layer-0 packed data */
+        NPU_REG(REG_DMA_IN_STRIDE) = (e[19] != 0 && is_nhwc_input) ? (in_w * in_c * eb) : 0;
     }
     NPU_REG(REG_DMA_OUT_STRIDE) = 0;
 
