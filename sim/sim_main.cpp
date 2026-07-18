@@ -6,12 +6,34 @@
 #include <cstdio>
 #include <cstdlib>
 
+#ifdef VCD_TRACE
+#include <verilated_vcd_c.h>
+#endif
+
 #define MAX_SIM_TIME 500000000  // 500M cycles (~10s @ 50MHz)
 #define UART_TIMEOUT  200000000  // Stop if no UART activity for 200M cycles
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
+
+#ifdef VCD_TRACE
+    Verilated::traceEverOn(true);
+#endif
+
     Vsim* top = new Vsim;
+
+#ifdef VCD_TRACE
+    VerilatedVcdC* tfp = new VerilatedVcdC;
+    top->trace(tfp, 99);
+    tfp->open("sim.vcd");
+    printf("[SoC Sim] VCD tracing enabled → sim.vcd\n");
+    bool vcd_active = false;
+    uint64_t vcd_start = 0;
+    uint64_t vcd_duration = 0;
+    const char* vcd_env = getenv("VCD_WINDOW");
+    if (vcd_env) vcd_duration = strtoull(vcd_env, NULL, 10);
+    else vcd_duration = 5000000;  // Default: 5M cycles window
+#endif
 
     // Initialize signals
     top->sys_clk = 0;
@@ -46,6 +68,24 @@ int main(int argc, char** argv) {
 
         // Check UART output on rising edge
         if (top->sys_clk) {
+#ifdef VCD_TRACE
+            // Start VCD when NPU becomes busy (layer 0 starts)
+            // Detect by monitoring NPU interrupt or UART "Layers:" message
+            if (!vcd_active && uart_bytes > 100) {
+                // UART has printed the header, NPU should be starting soon
+                vcd_active = true;
+                vcd_start = sim_time;
+                printf("[SoC Sim] VCD recording started at cycle %lu (window=%lu)\n",
+                       sim_time / 2, vcd_duration / 2);
+            }
+            if (vcd_active) {
+                tfp->dump(sim_time);
+                if (sim_time - vcd_start > vcd_duration) {
+                    vcd_active = false;
+                    printf("[SoC Sim] VCD recording stopped at cycle %lu\n", sim_time / 2);
+                }
+            }
+#endif
             if (top->serial_source_valid) {
                 char c = (char)(top->serial_source_data & 0xFF);
                 putchar(c);
@@ -66,6 +106,10 @@ int main(int argc, char** argv) {
     printf("[SoC Sim] Simulation ended at cycle %lu, %d UART bytes received\n",
            sim_time / 2, uart_bytes);
 
+#ifdef VCD_TRACE
+    tfp->close();
+    delete tfp;
+#endif
     top->final();
     delete top;
     return (uart_bytes > 0) ? 0 : 1;
