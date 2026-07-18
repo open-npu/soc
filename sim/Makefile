@@ -29,6 +29,11 @@ VERILATOR_FLAGS = --cc --exe -O3 \
     -I$(NPU_INC_DIR) \
     +define+ACC_WIDTH=44
 
+# VCD tracing (enabled when VCD=1)
+ifeq ($(VCD),1)
+VERILATOR_FLAGS += --trace --trace-depth 5 -CFLAGS -DVCD_TRACE
+endif
+
 .PHONY: all build run clean generate
 
 all: run
