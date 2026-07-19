@@ -29,6 +29,11 @@ VERILATOR_FLAGS = --cc --exe -O3 \
     -I$(NPU_INC_DIR) \
     +define+ACC_WIDTH=44
 
+# Debug defines (enabled when DEBUG=1)
+ifeq ($(DEBUG),1)
+VERILATOR_FLAGS += +define+DBG_DOTBUF
+endif
+
 # VCD tracing (enabled when VCD=1)
 ifeq ($(VCD),1)
 VERILATOR_FLAGS += --trace --trace-depth 5 -CFLAGS -DVCD_TRACE
