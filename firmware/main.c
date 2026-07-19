@@ -109,10 +109,22 @@ static void uart_put_dec(int32_t v) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  DCache flush (VexRiscv custom instruction)
+ *  DCache flush/invalidate (VexRiscv custom instructions)
  *  ═══════════════════════════════════════════════════════════════════ */
 static inline void dcache_flush(void) {
+    /* Clean D-cache: write-back dirty lines to DDR */
     asm volatile(".word 0x500F" : : : "memory");
+}
+/* Invalidate cache line containing addr (VexRiscv custom instruction).
+ * Use after DMA writes to DDR, before CPU reads. */
+static inline void dcache_inval_addr(void *addr) {
+    asm volatile(".word 0x003b" : : "r"(addr) : "memory");
+}
+/* Invalidate a range of DDR addresses (force CPU to re-read from DDR). */
+static void dcache_inval_range(volatile void *ptr, uint32_t size) {
+    /* VexRiscv: use flush (0x500F) which also invalidates clean lines.
+     * For NPU output, lines are clean (CPU didn't write), so flush = invalidate. */
+    dcache_flush();
 }
 
 #define NPU_WGT_BASE     0x4002C000  /* workspace for wgt (16KB) */
@@ -372,7 +384,7 @@ static int run_chained_model(test_case_t *tc) {
             return -1;
         }
 
-        /* Invalidate DCache so CPU reads DMA-written DDR output */
+        /* Flush DCache so CPU reads DMA-written DDR output (not stale cache) */
         dcache_flush();
 
         /* Verify output: compare DDR at ddr_out_addr vs golden */
@@ -381,12 +393,13 @@ static int run_chained_model(test_case_t *tc) {
             const uint32_t *golden = cursor + LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2];
             volatile const uint32_t *out_ptr = (volatile const uint32_t *)(uintptr_t)e[31];
 
-            /* Debug: for layer 0, print first 10 output words vs golden */
-            if (l == 0) {
-                uart_puts("  DBG: out_addr=0x");
+            /* Debug: for layer 0-2, print first 5 output words vs golden */
+            if (l < 3) {
+                uart_puts("  DBG L"); uart_put_dec(l);
+                uart_puts(": out_addr=0x");
                 uart_put_hex32(e[31]);
                 uart_puts("\n");
-                for (int dbg = 0; dbg < 10 && dbg < (int)n_output; dbg++) {
+                for (int dbg = 0; dbg < 5 && dbg < (int)n_output; dbg++) {
                     uart_puts("  w[");
                     uart_put_dec(dbg);
                     uart_puts("] exp=0x");
