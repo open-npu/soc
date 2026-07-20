@@ -392,7 +392,7 @@ static int run_chained_model(test_case_t *tc) {
          * pre-packed input, not chain input. Only verify L0 and last layer. */
         uint32_t n_output = e[3];
 #ifdef RUN_MODEL_B
-        int skip_verify = (l > 0 && l < (int)num_layers - 1);
+        int skip_verify = 0;  /* Debug: verify all layers to find bugs */
 #else
         int skip_verify = 0;
 #endif
