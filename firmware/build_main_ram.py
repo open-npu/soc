@@ -137,6 +137,8 @@ def main():
         # Params at ddr_param_addr
         if layer['ddr_param'] and n_param > 0:
             base = ((layer['ddr_param'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
+            if l == 2:
+                print(f"  L2 param: ddr=0x{layer['ddr_param']:08x} base=0x{base:x} n_param={n_param} data[0]=0x{layer['param'][0]:08x}")
             for i, w in enumerate(layer['param']):
                 ram[base + i] = w
 
