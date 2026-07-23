@@ -228,10 +228,8 @@ static void npu_program_layer(const uint32_t *e,
     NPU_REG(REG_DMA_WGT_ADDR)   = e[29];
     NPU_REG(REG_DMA_PARAM_ADDR) = e[30];
 
-    /* Add/Concat branch B */
-    if (op_type == 4 || op_type == 7) {
-        NPU_REG(REG_DMA_ADD_B_ADDR) = runtime_add_b_addr;
-    }
+    /* Add/Concat branch B — always write to clear stale value from previous layer */
+    NPU_REG(REG_DMA_ADD_B_ADDR) = (op_type == 4 || op_type == 7) ? runtime_add_b_addr : 0;
 
     /* DMA sizes */
     NPU_REG(REG_DMA_IN_SIZE)  = e[15];
