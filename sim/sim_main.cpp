@@ -10,8 +10,8 @@
 #include <verilated_vcd_c.h>
 #endif
 
-#define MAX_SIM_TIME 500000000  // 500M cycles (~10s @ 50MHz)
-#define UART_TIMEOUT  200000000  // Stop if no UART activity for 200M cycles
+#define MAX_SIM_TIME 2000000000  // 2B cycles (~40s @ 50MHz)
+#define UART_TIMEOUT  2000000000  // Stop if no UART activity for 2B cycles
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);

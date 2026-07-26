@@ -119,7 +119,15 @@ def main():
     for i, w in enumerate(td_words[:3]):  # 3-word blob header
         ram[blob_offset + i] = w
 
-    # 3. Scatter layer payloads to DDR addresses
+    # 3. Place the entire blob (headers + inline payloads) at BLOB_BASE
+    #    so firmware can parse layer_entry_t headers and read golden outputs.
+    #    MUST run before step 4 (DDR scatter) so scatter overwrites payload
+    #    regions with correct per-layer data (blob inline payloads may differ).
+    blob_offset_full = (BLOB_BASE // 4) & 0xFFFFFF
+    for i, w in enumerate(td_words):
+        ram[blob_offset_full + i] = w
+
+    # 4. Scatter layer payloads to DDR addresses (overwrites blob inline data)
     #    main_ram array index = (ddr_byte_addr - MAIN_RAM_BASE) // 4
     for l, layer in enumerate(layers):
         hdr = layer['header']
@@ -153,12 +161,6 @@ def main():
             base = ((layer['ddr_out'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
             for i, w in enumerate(layer['output']):
                 ram[base + i] = w
-
-    # 4. Place the entire blob (headers + inline payloads) at BLOB_BASE
-    #    so firmware can parse layer_entry_t headers and read golden outputs.
-    blob_offset_full = (BLOB_BASE // 4) & 0xFFFFFF
-    for i, w in enumerate(td_words):
-        ram[blob_offset_full + i] = w
 
     # 5. Write @address hex format for $readmemh
     with open(output_init, 'w') as f:

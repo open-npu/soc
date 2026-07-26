@@ -27,7 +27,8 @@ VERILATOR_FLAGS = --cc --exe -O3 \
     -Wno-UNOPTFLAT -Wno-COMBDLY -Wno-LATCH -Wno-CASEINCOMPLETE \
     --top-module $(VERILOG_TOP) \
     -I$(NPU_INC_DIR) \
-    +define+ACC_WIDTH=44
+    +define+ACC_WIDTH=44 \
+    +define+SYNTHESIS
 
 # Debug defines (enabled when DEBUG=1)
 ifeq ($(DEBUG),1)
