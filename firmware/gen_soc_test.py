@@ -269,7 +269,11 @@ def generate_header(model_name, blob_size):
 def main():
     parser = argparse.ArgumentParser(description='Generate SoC test data for chained model inference')
     parser.add_argument('--model', required=True,
-                        choices=['model_a_int16', 'model_b_int16', 'model_b_int8', 'model_c_int16', 'model_d_int16'],
+                        choices=['model_a_int16', 'model_a_int8',
+                                 'model_b_int16', 'model_b_int8',
+                                 'model_c_int16', 'model_c_int8',
+                                 'model_d_int16', 'model_d_int8',
+                                 'model_e_int16', 'model_e_int8'],
                         help='Model to generate')
     parser.add_argument('--standalone-layer', type=int, default=-1,
                         help='Also pack input data for this layer (for standalone testing)')
