@@ -3,9 +3,9 @@
 #define SOC_TEST_DATA_H
 #include <stdint.h>
 
-/* Model: model_c_int8 */
+/* Model: model_d_int8 */
 #define BLOB_MODEL_BASE  0x40010000
-#define BLOB_MODEL_SIZE  8316740
+#define BLOB_MODEL_SIZE  2450396
 
 /* Per-layer blob entry header (36 uint32 words = 144 bytes) */
 typedef struct {
