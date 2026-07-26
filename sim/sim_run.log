@@ -1,0 +1,17 @@
+[SoC Sim] Starting VexRiscv + NPU SoC simulation...
+[SoC Sim] Reset deasserted, waiting for BIOS UART output...
+---UART OUTPUT BEGIN---
+
+
+========================================
+  Open-NPU SoC — Chained Model Inference
+========================================
+
+[INIT] NPU Version: 1.0.0
+      Array size: 16, HW config: 0x03C04110
+
+  ----------------------------------------
+  Model: model_c (YOLO-Tiny INT16, 17 layers)
+  ----------------------------------------
+  Layers: 17
+EXIT=137
