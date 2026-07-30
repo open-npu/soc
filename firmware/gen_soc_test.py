@@ -74,7 +74,15 @@ def load_model_golden(model_name):
 
 
 def remap_ddr(addr):
-    """Remap metadata DDR address (0x30XXXXXX) to SoC main RAM (0x40100000+)."""
+    """Remap metadata DDR address (0x30XXXXXX) to SoC main RAM.
+
+    MODEL_DDR_BASE is set dynamically in main() so the DDR scatter region
+    starts AFTER the end of the blob. Otherwise the blob's inline payload
+    (which includes the golden outputs firmware compares against) and the
+    DDR regions overlap: build_main_ram.py writes both into the same
+    main_ram array, and at runtime the NPU's output DMA overwrites the
+    golden data the firmware needs.
+    """
     if addr == 0:
         return 0
     return (addr & 0x0FFFFFFF) + MODEL_DDR_BASE
@@ -296,6 +304,21 @@ def main():
     print(f"Building chained blob...")
     blob = build_chained_blob(meta, data, args.standalone_layer)
     print(f"  Blob size: {len(blob)} bytes ({len(blob)/1024/1024:.1f} MB)")
+
+    # ─── Place DDR scatter region AFTER the blob ───
+    # The blob (headers + inline wgt/param/input/golden) lives at BLOB_BASE.
+    # The DDR regions must not overlap it, or build_main_ram.py's scatter and
+    # the NPU's runtime output DMA will clobber the golden data.
+    # Blob size does not depend on DDR addresses, so we can size it first,
+    # then rebuild the blob with the corrected MODEL_DDR_BASE.
+    global MODEL_DDR_BASE
+    blob_end = BLOB_BASE + len(blob)
+    ddr_base_needed = (blob_end + 0xFFFFF) & ~0xFFFFF  # round up to 1MB
+    if ddr_base_needed > MODEL_DDR_BASE:
+        print(f"  Blob ends at 0x{blob_end:08X}, moving DDR base "
+              f"0x{MODEL_DDR_BASE:08X} → 0x{ddr_base_needed:08X}")
+        MODEL_DDR_BASE = ddr_base_needed
+        blob = build_chained_blob(meta, data, args.standalone_layer)
 
     with open(BLOB_FILE, 'wb') as f:
         f.write(blob)
