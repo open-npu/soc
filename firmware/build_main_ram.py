@@ -121,14 +121,38 @@ def main():
 
     # 3. Place the entire blob (headers + inline payloads) at BLOB_BASE
     #    so firmware can parse layer_entry_t headers and read golden outputs.
-    #    MUST run before step 4 (DDR scatter) so scatter overwrites payload
-    #    regions with correct per-layer data (blob inline payloads may differ).
     blob_offset_full = (BLOB_BASE // 4) & 0xFFFFFF
     for i, w in enumerate(td_words):
         ram[blob_offset_full + i] = w
 
-    # 4. Scatter layer payloads to DDR addresses (overwrites blob inline data)
+    blob_end_word = blob_offset_full + len(td_words)
+
+    # 4. Scatter layer payloads to DDR addresses
     #    main_ram array index = (ddr_byte_addr - MAIN_RAM_BASE) // 4
+    #
+    #    CRITICAL: DDR regions must NOT overlap the blob range above. The blob's
+    #    inline payload holds the golden outputs the firmware compares against;
+    #    if a DDR region lands inside it, the NPU's output DMA destroys the
+    #    golden data at runtime and every layer reports bogus mismatches.
+    #    gen_soc_test.py places MODEL_DDR_BASE after the blob end — assert it.
+    overlaps = []
+    for l, layer in enumerate(layers):
+        hdr = layer['header']
+        for name, ddr, n in [('wgt', layer['ddr_wgt'], hdr[0]),
+                             ('param', layer['ddr_param'], hdr[1]),
+                             ('in', layer['ddr_in'], hdr[2]),
+                             ('out', layer['ddr_out'], hdr[3])]:
+            if ddr and n > 0:
+                b = ((ddr - MAIN_RAM_BASE) // 4) & 0xFFFFFF
+                if b < blob_end_word and blob_offset_full < b + n:
+                    overlaps.append(f"L{l} {name} @0x{b:x}+{n}")
+    if overlaps:
+        raise SystemExit(
+            f"ERROR: {len(overlaps)} DDR region(s) overlap the blob "
+            f"[0x{blob_offset_full:x}, 0x{blob_end_word:x}):\n  "
+            + "\n  ".join(overlaps[:8])
+            + "\nRe-run gen_soc_test.py — it sizes MODEL_DDR_BASE past the blob end.")
+
     for l, layer in enumerate(layers):
         hdr = layer['header']
         n_wgt = hdr[0]
