@@ -166,14 +166,6 @@ def main():
             for i, w in enumerate(layer['wgt']):
                 ram[base + i] = w
 
-        # Params at ddr_param_addr
-        if layer['ddr_param'] and n_param > 0:
-            base = ((layer['ddr_param'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
-            if l == 2:
-                print(f"  L2 param: ddr=0x{layer['ddr_param']:08x} base=0x{base:x} n_param={n_param} data[0]=0x{layer['param'][0]:08x}")
-            for i, w in enumerate(layer['param']):
-                ram[base + i] = w
-
         # Input at ddr_in_addr (layer 0 only)
         if layer['ddr_in'] and n_input > 0:
             base = ((layer['ddr_in'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
@@ -184,6 +176,20 @@ def main():
         if layer['ddr_out'] and n_output > 0:
             base = ((layer['ddr_out'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
             for i, w in enumerate(layer['output']):
+                ram[base + i] = w
+
+        # Params at ddr_param_addr — MUST be scattered AFTER output.
+        # Some layers (model_c L12/L13/L14) allocate ddr_param_addr == ddr_out_addr.
+        # The NPU loads params into param SRAM at layer start (S_LOAD_PARAM),
+        # before it writes any output, so as long as the param data is present at
+        # load time the later output overwrite is harmless. If output were
+        # scattered last, the RTL would read golden-output words as rescale
+        # params (observed as M=273 vs the correct 30459), corrupting the layer.
+        if layer['ddr_param'] and n_param > 0:
+            base = ((layer['ddr_param'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
+            if l == 2:
+                print(f"  L2 param: ddr=0x{layer['ddr_param']:08x} base=0x{base:x} n_param={n_param} data[0]=0x{layer['param'][0]:08x}")
+            for i, w in enumerate(layer['param']):
                 ram[base + i] = w
 
     # 5. Write @address hex format for $readmemh
