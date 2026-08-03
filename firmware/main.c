@@ -331,6 +331,11 @@ static int run_chained_model(test_case_t *tc) {
         uint32_t runtime_in_addr;
         if (l == 0) {
             runtime_in_addr = e[32];  /* layer 0: use blob's ddr_in_addr */
+        } else if (op_type == 7 && residual_src >= 0 && residual_src < (int32_t)num_layers) {
+            /* Concat phase 2: true input is residual_src's output (e.g. L8),
+             * NOT the previous layer's output (that's the other concat
+             * phase's partial buffer). */
+            runtime_in_addr = layer_out_addr[residual_src];
         } else if (input_src >= 0 && input_src < (int32_t)num_layers) {
             runtime_in_addr = layer_out_addr[input_src];  /* skip connection */
         } else {
@@ -339,7 +344,17 @@ static int run_chained_model(test_case_t *tc) {
 
         /* Resolve Add/Concat branch-B address */
         uint32_t runtime_add_b_addr = 0;
-        if (residual_src >= 0 && residual_src < (int32_t)num_layers) {
+        if (op_type == 7) {
+            /* Concat: ADD_B_ADDR carries the OUT-region preload source — the
+             * previous concat phase's DDR output (layer l-1). Only phases
+             * with concat offset != 0 need the carryover preload; the first
+             * phase (offset 0) owns ch[0:in_c) and needs no preload. RTL keys
+             * the in-place store on op_type==4, so a nonzero add_b here no
+             * longer misroutes the store region. */
+            uint32_t concat_off = e[18] & 0xFFFF;
+            if (concat_off != 0 && l > 0)
+                runtime_add_b_addr = layer_out_addr[l - 1];
+        } else if (residual_src >= 0 && residual_src < (int32_t)num_layers) {
             runtime_add_b_addr = layer_out_addr[residual_src];
         } else if (e[33] != 0) {
             runtime_add_b_addr = e[33];  /* fallback: metadata's ddr_add_b_addr */
@@ -415,6 +430,43 @@ static int run_chained_model(test_case_t *tc) {
                 }
             }
             int layer_err = 0;
+            if (op_type == 7) {
+                /* Concat: verify only the channels this phase owns.
+                 * concat_cfg = (total_c << 16) | offset; owned ch range is
+                 * [offset, offset + in_c). The rest of the buffer is the
+                 * other phase's data (or undefined for the offset-0 phase,
+                 * whose golden has zeros that dirty SRAM cannot provide). */
+                uint32_t c_off  = e[18] & 0xFFFF;
+                uint32_t in_c   = e[7];
+                uint32_t out_c  = e[9];
+                uint32_t eb     = (e[5] & 1) ? 2 : 1;
+                uint32_t emask  = (eb == 2) ? 0xFFFF : 0xFF;
+                uint32_t total_elems = n_output * 4 / eb;
+                uint32_t ch = 0;
+                for (uint32_t idx = 0; idx < total_elems; idx++) {
+                    if (ch >= c_off && ch < c_off + in_c) {
+                        uint32_t w  = (idx * eb) >> 2;
+                        uint32_t sh = (idx * eb & 3) << 3;
+                        uint32_t ge = (golden[w] >> sh) & emask;
+                        uint32_t oe = (out_ptr[w] >> sh) & emask;
+                        if (ge != oe) {
+                            if (layer_err < 10) {
+                                uart_puts("  L");
+                                uart_put_dec(l);
+                                uart_puts(" elem[");
+                                uart_put_dec(idx);
+                                uart_puts("]: exp=0x");
+                                uart_put_hex32(ge);
+                                uart_puts(" got=0x");
+                                uart_put_hex32(oe);
+                                uart_putc('\n');
+                            }
+                            layer_err++;
+                        }
+                    }
+                    if (++ch == out_c) ch = 0;
+                }
+            } else {
             for (uint32_t i = 0; i < n_output; i++) {
                 if (out_ptr[i] != golden[i]) {
             if (layer_err < 10) {
@@ -430,6 +482,7 @@ static int run_chained_model(test_case_t *tc) {
                 }
                     layer_err++;
                 }
+            }
             }
 
             if (layer_err == 0) {
