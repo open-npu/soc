@@ -94,6 +94,38 @@ def build_chained_blob(meta, data, standalone_layer=-1):
     Each layer has 36-word header + wgt + param + input(L0 only) + golden output.
     DDR addresses are remapped from 0x30XXXXXX to 0x40XXXXXX.
     """
+    # ─── Re-allocate DDR regions non-overlapping ───
+    # The packer (bin2golden.generate_golden + generator Add patching) can leave
+    # a layer's OUT region overlapping the NEXT layer's WGT region (e.g. model_d
+    # L12 Add out vs L13 Conv wgt, 128-word overlap → L13 loads corrupted weights).
+    # The metadata's relative spacing is only safe for standalone (single-layer)
+    # use; chained inference needs each layer's regions to be disjoint because a
+    # layer's runtime output DMA must not clobber another layer's weights/params.
+    # Recompute each region sequentially from MODEL_DDR_BASE with 4KB alignment.
+    # ddr_add_b is NOT allocated: the firmware always resolves it at runtime to a
+    # producing layer's OUT region (layer_out_addr[residual_src] / concat l-1).
+    ALIGN = 4096
+    def _align(v):
+        return (v + ALIGN - 1) & ~(ALIGN - 1)
+    alloc = []  # per-layer (ddr_in, ddr_wgt, ddr_param, ddr_out)
+    cur = MODEL_DDR_BASE
+    for i, (m, d) in enumerate(zip(meta, data)):
+        n_wgt = len(d['wgt']); n_param = len(d['param'])
+        n_in  = len(d['input']) if (i == 0 or i == standalone_layer) else 0
+        n_out = len(d['output'])
+        dma_out = m.get('dma_out_size', 0)
+        out_bytes = max(n_out * 4, dma_out)
+        ddr_in = ddr_wgt = ddr_param = ddr_out = 0
+        if n_in > 0:
+            ddr_in = cur; cur += _align(n_in * 4)
+        if n_wgt > 0:
+            ddr_wgt = cur; cur += _align(n_wgt * 4)
+        if n_param > 0:
+            ddr_param = cur; cur += _align(n_param * 4)
+        if n_out > 0:
+            ddr_out = cur; cur += _align(out_bytes)
+        alloc.append((ddr_in, ddr_wgt, ddr_param, ddr_out))
+
     buf = bytearray()
     buf += pack_u32(MAGIC)
     buf += pack_u32(len(meta))
@@ -111,11 +143,11 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         n_input = len(inp) if (i == 0 or i == standalone_layer) else 0
         n_output = len(out)
 
-        # Remap DDR addresses
-        ddr_wgt = remap_ddr(m.get('ddr_wgt_addr', 0))
-        ddr_param = remap_ddr(m.get('ddr_param_addr', 0))
-        ddr_out = remap_ddr(m.get('ddr_out_addr', 0))
-        ddr_in = remap_ddr(m.get('ddr_in_addr', 0)) if (i == 0 or i == standalone_layer) else 0
+        # Use the re-allocated non-overlapping DDR addresses
+        ddr_in, ddr_wgt, ddr_param, ddr_out = alloc[i]
+        # ddr_add_b: firmware overrides with the producing layer's OUT region.
+        # Keep the metadata remap only as a harmless fallback (never used for
+        # Add/Concat where residual_src/l-1 is always valid).
         ddr_add_b = remap_ddr(m.get('ddr_add_b_addr', 0))
 
         # Pack fields
