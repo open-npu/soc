@@ -241,8 +241,12 @@ static void npu_program_layer(const uint32_t *e,
 
     /* Tiled DB_EN prefetch + PTS 2D DMA */
     if (e[23] > 0) NPU_REG(REG_DMA_TILE_IN_SIZE) = e[23];
+    /* STORE_MODE must be written unconditionally — in a chained run a stale
+     * PTS_EN=1 from a previous tiled layer would otherwise divert a non-PTS
+     * layer's final store to the S_TILE_STORE path with the wrong source
+     * address (hit by model_a L61 after L60: output read back as zeros). */
+    NPU_REG(REG_DMA_STORE_MODE)    = e[22];
     if (e[22] > 0) {
-        NPU_REG(REG_DMA_STORE_MODE)    = e[22];
         NPU_REG(REG_DMA_TILE_OUT_SIZE) = e[24];
         NPU_REG(REG_DMA_ROW_CFG)       = e[25];
     }
@@ -659,6 +663,8 @@ void main(void) {
     test_case_t tc = { BLOB_MODEL_BASE, "model_c (YOLO-Tiny INT16, 17 layers)" };
 #elif defined(RUN_MODEL_D)
     test_case_t tc = { BLOB_MODEL_BASE, "model_d (Palm Vein INT16, 24 layers)" };
+#elif defined(RUN_MODEL_E)
+    test_case_t tc = { BLOB_MODEL_BASE, "model_e (MobileNetV2-Tiny INT16, 31 layers)" };
 #else
     uart_puts("ERROR: No model selected. Compile with -DRUN_MODEL_X\n");
     while (1) {}
