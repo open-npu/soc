@@ -11,7 +11,10 @@
 #endif
 
 #define MAX_SIM_TIME 20000000000  // 20B cycles — model_e (31 layers) needs >5B
-#define UART_TIMEOUT  3000000000  // Stop if no UART activity for 3B cycles
+// sim_time counts half-cycles (2 per clock), so 12B here = 6B cycles of
+// UART silence. model_c int16 L2 (390 tiles) needs ~1.4B cycles with no
+// UART output — the old 3B (1.5B cycles) marginally killed it mid-layer.
+#define UART_TIMEOUT  12000000000
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
