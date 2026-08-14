@@ -388,6 +388,9 @@ static int run_chained_model(test_case_t *tc) {
 
         /* Wait for completion */
         int ret = npu_wait_done();
+        /* Perf counters: busy cycles + MAC issues since last soft-rst */
+        uint32_t perf_npu  = NPU_REG(0x01C);
+        uint32_t perf_macs = NPU_REG(0x020);
         if (ret != 0) {
             uart_puts("  L");
             uart_put_dec(l);
@@ -504,6 +507,16 @@ static int run_chained_model(test_case_t *tc) {
                 uart_put_dec(n_output);
                 uart_puts(" mismatches\n");
                 total_err += layer_err;
+            }
+            /* Perf: NPU busy cycles + MAC issues (from HW counters) */
+            {
+                uart_puts("  PERF_L");
+                uart_put_dec(l);
+                uart_puts(" npu=");
+                uart_put_dec(perf_npu);
+                uart_puts(" mac=");
+                uart_put_dec(perf_macs);
+                uart_puts("\n");
             }
         } else if (skip_verify) {
             uart_puts("  L");

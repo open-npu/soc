@@ -95,6 +95,21 @@ int main(int argc, char** argv) {
                 fflush(stdout);
                 uart_bytes++;
                 last_uart_time = sim_time;
+
+                // Perf: timestamp completed layer-result UART lines
+                static char linebuf[256];
+                static int linepos = 0;
+                if (c == '\n' || linepos >= 250) {
+                    linebuf[linepos] = 0;
+                    if ((linepos > 4 && linebuf[0] == ' ' && linebuf[1] == ' '
+                         && linebuf[2] == 'L' && strchr(linebuf, ':'))
+                        || strstr(linebuf, "RESULT")) {
+                        printf("[PERF] cyc=%lu | %s\n", sim_time / 2, linebuf);
+                    }
+                    linepos = 0;
+                } else if (c != '\r') {
+                    linebuf[linepos++] = c;
+                }
             }
 
             // Early termination: if we've received UART data and then
