@@ -18,6 +18,9 @@ BLOB_BASE = 0x40010000      # blob header + layer entries at 64KB offset
 
 MAGIC = 0x4E505532
 LAYER_ENTRY_HDR_WORDS = 36
+# Runtime DDR output workspace. Must not be pre-filled with golden: an NPU
+# that never stores would then compare equal and report a false PASS.
+OUT_POISON = 0xDEADBEEF
 
 
 def bin_to_words(data):
@@ -80,9 +83,88 @@ def parse_blob(blob_words):
     return layers
 
 
+def parse_init(path):
+    """Parse @address hex $readmemh file into {word_offset: value}."""
+    ram = {}
+    addr = 0
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('@'):
+                addr = int(line[1:], 16)
+                continue
+            ram[addr] = int(line, 16)
+            addr += 1
+    return ram
+
+
+def self_test():
+    """Workspace outputs must be poison; golden stays only in the blob."""
+    import tempfile
+
+    hdr = [0] * LAYER_ENTRY_HDR_WORDS
+    hdr[0] = 1  # n_wgt
+    hdr[1] = 1  # n_param
+    hdr[2] = 1  # n_input
+    hdr[3] = 4  # n_output
+    hdr[29] = 0x40300000  # ddr_wgt
+    hdr[30] = 0x40301000  # ddr_param
+    hdr[31] = 0x40302000  # ddr_out
+    hdr[32] = 0x40303000  # ddr_in
+    wgt, param, inp = [0xAAAA0001], [0xBBBB0002], [0xCCCC0003]
+    golden = [0x11111111, 0x22222222, 0x33333333, 0x44444444]
+    blob = [MAGIC, 1, 0] + hdr + wgt + param + inp + golden
+
+    def words_to_bytes(words):
+        return b''.join(struct.pack('<I', w & 0xFFFFFFFF) for w in words)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fw = os.path.join(tmp, 'fw.bin')
+        td = os.path.join(tmp, 'td.bin')
+        init = os.path.join(tmp, 'ram.init')
+        with open(fw, 'wb') as f:
+            f.write(b'\x00\x00\x00\x00')
+        with open(td, 'wb') as f:
+            f.write(words_to_bytes(blob))
+        rc = os.system(
+            f'{sys.executable} {os.path.abspath(__file__)} {fw} {td} {init}'
+        )
+        if rc:
+            raise SystemExit(f'self-test: build_main_ram failed rc={rc}')
+        ram = parse_init(init)
+
+    out_base = ((0x40302000 - MAIN_RAM_BASE) // 4) & 0xFFFFFF
+    for i, g in enumerate(golden):
+        got = ram.get(out_base + i)
+        if got != OUT_POISON:
+            raise SystemExit(
+                f'self-test: ddr_out[{i}]=0x{got if got is not None else 0:08X} '
+                f'want poison 0x{OUT_POISON:08X}'
+            )
+        if got == g:
+            raise SystemExit('self-test: workspace still holds golden')
+
+    blob_base = (BLOB_BASE // 4) & 0xFFFFFF
+    golden_off = blob_base + 3 + LAYER_ENTRY_HDR_WORDS + 1 + 1 + 1
+    for i, g in enumerate(golden):
+        got = ram.get(golden_off + i)
+        if got != g:
+            raise SystemExit(
+                f'self-test: blob golden[{i}]=0x{got if got is not None else 0:08X} '
+                f'want 0x{g:08X}'
+            )
+    print('build_main_ram self-test: PASS (workspace poison, blob golden intact)')
+
+
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == '--self-test':
+        self_test()
+        return
     if len(sys.argv) != 4:
         print(f'Usage: {sys.argv[0]} firmware.bin test_data.bin output.init')
+        print(f'       {sys.argv[0]} --self-test')
         sys.exit(1)
 
     firmware_bin = sys.argv[1]
@@ -172,11 +254,12 @@ def main():
             for i, w in enumerate(layer['input']):
                 ram[base + i] = w
 
-        # Golden output at ddr_out_addr
+        # Runtime output workspace: poison, not golden. Golden stays only in
+        # the blob (read-only compare region). Unwritten words must not PASS.
         if layer['ddr_out'] and n_output > 0:
             base = ((layer['ddr_out'] - MAIN_RAM_BASE) // 4) & 0xFFFFFF
-            for i, w in enumerate(layer['output']):
-                ram[base + i] = w
+            for i in range(n_output):
+                ram[base + i] = OUT_POISON
 
         # Params at ddr_param_addr — MUST be scattered AFTER output.
         # Some layers (model_c L12/L13/L14) allocate ddr_param_addr == ddr_out_addr.

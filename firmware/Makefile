@@ -31,9 +31,24 @@ SIM_DIR = ../sim
 
 all: $(TARGET).bin $(TARGET).hex $(MAIN_RAM_INIT)
 
-# Model selection (passed via DEFINES)
+# Model selection. MODEL=model_x also injects -DRUN_model_x for main.c.
 MODEL ?= model_x
 STANDALONE_LAYER ?= -1
+ifeq ($(findstring model_x,$(MODEL)),model_x)
+DEFINES += -DRUN_model_x
+endif
+ifeq ($(findstring model_x,$(MODEL)),model_x)
+DEFINES += -DRUN_model_x
+endif
+ifeq ($(findstring model_c,$(MODEL)),model_c)
+DEFINES += -DRUN_MODEL_C
+endif
+ifeq ($(findstring model_x,$(MODEL)),model_x)
+DEFINES += -DRUN_model_x
+endif
+ifeq ($(findstring model_e,$(MODEL)),model_e)
+DEFINES += -DRUN_MODEL_E
+endif
 
 # Generate test data header and binary blob together
 $(TEST_DATA_H) $(TEST_DATA_BIN):

@@ -58,6 +58,7 @@ int main(int argc, char** argv) {
     int uart_bytes = 0;
     int dma_wr_count = 0;  // Track DMA writes for debug
     bool layer0_started = false;
+    int result_code = -1;  // -1 running, 0 PASS, 1 FAIL
 
     printf("[SoC Sim] Starting VexRiscv + NPU SoC simulation...\n");
     printf("[SoC Sim] Reset deasserted, waiting for BIOS UART output...\n");
@@ -106,10 +107,18 @@ int main(int argc, char** argv) {
                         || strstr(linebuf, "RESULT")) {
                         printf("[PERF] cyc=%lu | %s\n", sim_time / 2, linebuf);
                     }
+                    if (strstr(linebuf, "RESULT: PASS"))
+                        result_code = 0;
+                    else if (strstr(linebuf, "RESULT: FAIL"))
+                        result_code = 1;
                     linepos = 0;
                 } else if (c != '\r') {
                     linebuf[linepos++] = c;
                 }
+            }
+
+            if (result_code >= 0 && (sim_time - last_uart_time) > 100000) {
+                break;
             }
 
             // Early termination: if we've received UART data and then
@@ -130,5 +139,15 @@ int main(int argc, char** argv) {
 #endif
     top->final();
     delete top;
-    return (uart_bytes > 0) ? 0 : 1;
+    if (result_code == 0)
+        return 0;
+    if (result_code == 1)
+        fprintf(stderr, "[SoC Sim] FAIL: RESULT: FAIL\n");
+    else if (sim_time >= MAX_SIM_TIME)
+        fprintf(stderr, "[SoC Sim] FAIL: hit MAX_SIM_TIME without RESULT: PASS\n");
+    else
+        fprintf(stderr,
+                "[SoC Sim] FAIL: no RESULT: PASS (uart_bytes=%d)\n",
+                uart_bytes);
+    return 1;
 }
