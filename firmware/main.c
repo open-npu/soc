@@ -30,6 +30,7 @@
 #define REG_STATUS          0x004
 #define REG_IRQ_EN          0x008
 #define REG_IRQ_STATUS      0x00C
+#define REG_ERROR_CODE      0x010
 #define REG_VERSION         0x014
 #define REG_HW_CONFIG       0x018
 #define REG_LAYER_MODE      0x040
@@ -75,8 +76,14 @@
 #define STATUS_BUSY     (1U << 0)
 #define STATUS_DONE     (1U << 3)
 #define STATUS_ERROR    (1U << 2)
+#define IRQ_DONE        (1U << 0)
+#define IRQ_ERROR       (1U << 1)
 
 #define MAX_LAYERS 80
+
+/* Must match soc/firmware/build_main_ram.py OUT_POISON.
+ * Workspace DDR outputs are initialized to this, not golden. */
+#define OUT_POISON      0xDEADBEEFu
 
 /* ═══════════════════════════════════════════════════════════════════
  *  UART helpers
@@ -165,9 +172,13 @@ static int npu_wait_done(void) {
     while (timeout--) {
         uint32_t irq_st = NPU_REG(REG_IRQ_STATUS);
         uint32_t status = NPU_REG(REG_STATUS);
-        if (irq_st & 0x1) return 0;   /* IRQ_DONE latched */
+        /* Capacity guards pulse hw_error for 1 cycle then go idle. The
+         * latched IRQ_ERROR bit is the durable signal; STATUS_ERROR is not.
+         * Idle (!BUSY) is the reset/error state, not completion — treating
+         * it as done made poison cells report npu=0 instead of ERROR. */
+        if (irq_st & IRQ_ERROR) return -1;
         if (status & STATUS_ERROR) return -1;
-        if (!(status & STATUS_BUSY)) return 0;
+        if (irq_st & IRQ_DONE) return 0;
     }
     return -2; /* timeout */
 }
@@ -181,7 +192,9 @@ static int npu_wait_done(void) {
  *   runtime_in_addr: resolved input DDR address (layer 0: from entry[32],
  *                    N>0: producing layer's ddr_out_addr)
  *   runtime_add_b_addr: resolved Add/Concat branch-B DDR address (0 if none)
- *   act_base: SRAM act base (0 for normal; 0 for fused — RTL handles reuse)
+ *   act_base: SRAM word address to read activations from.
+ *             0 for a normal DDR load; previous layer's out_base for
+ *             non-tiled FUSE_MID/END (skip_act_load).
  */
 static void npu_program_layer(const uint32_t *e,
                               uint32_t runtime_in_addr,
@@ -265,8 +278,13 @@ static void npu_program_layer(const uint32_t *e,
     }
     NPU_REG(REG_DMA_OUT_STRIDE) = 0;
 
-    /* DMA control: sched_ctrl (DB_EN/FUSE/PTS bits from metadata) */
-    NPU_REG(REG_DMA_CTRL) = sched;
+    /* DMA control: keep DB_EN/PTS. Drop FUSE_START/MID/END so RTL always
+     * DMA-loads and stores. Non-tiled L17/L18 SRAM reuse (act_base) still
+     * produced a fully-wrong L19; mixed tiled-then-untiled fuse is unsafe.
+     *
+     * Do not clear DB_EN here: npu_ctrl only walks tiles / PTS when db_en=1.
+     * Oversized fused tiles must be refit in the golden generator. */
+    NPU_REG(REG_DMA_CTRL) = sched & ~0x0Eu;
 
     /* Post-processing */
     NPU_REG(REG_POST_CTRL)      = e[13];
@@ -329,7 +347,6 @@ static int run_chained_model(test_case_t *tc) {
         uint32_t op_type = e[4];
         int32_t input_src = (int32_t)e[34];
         int32_t residual_src = (int32_t)e[35];
-        uint32_t sched = e[21];
 
         /* Resolve runtime input address */
         uint32_t runtime_in_addr;
@@ -364,21 +381,30 @@ static int run_chained_model(test_case_t *tc) {
             runtime_add_b_addr = e[33];  /* fallback: metadata's ddr_add_b_addr */
         }
 
-        /* Soft-reset between non-fused layers */
-        if (l > 0 && !(sched & 0x06)) {  /* not FUSE_MID or FUSE_END */
+        /* Always soft-reset between layers. Mixed tiled→untiled fuse cannot
+         * reuse SRAM (L16 out at word 1568 overlaps L17 out at 3136), and
+         * DMA_CTRL strips FUSE bits so every layer DMA-loads to SRAM[0].
+         * Skipping reset here used to preserve SRAM; that path is gone. */
+        if (l > 0) {
             NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
             for (volatile int d = 0; d < 100; d++) {}
-            NPU_REG(REG_IRQ_STATUS) = 0x7;
         }
+        NPU_REG(REG_IRQ_STATUS) = 0x7;  /* always W1C before START */
 
-        /* Use original sched_ctrl from metadata (DB_EN + PTS enabled) */
-        npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, 0);
+        /* DMA load always writes SRAM[0]; compute must read from 0.
+         * The old act_base=prev_out for non-tiled FUSE_MID/END pointed at
+         * L16's SRAM output while the fresh DDR load sat at address 0. */
+        uint32_t act_base = 0;
+
+        npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, act_base);
         dcache_flush();
-        if (l < 3) {
+        if (l < 3 || (l >= 15 && l <= 19)) {
             uart_puts("  DBG L"); uart_put_dec(l);
             uart_puts(": in_addr=0x"); uart_put_hex32(runtime_in_addr);
             uart_puts(" e32=0x"); uart_put_hex32(e[32]);
             uart_puts(" in_stride=0x"); uart_put_hex32(NPU_REG(0x110));
+            uart_puts(" act_base="); uart_put_dec(act_base);
+            uart_puts(" dma_ctrl=0x"); uart_put_hex32(NPU_REG(REG_DMA_CTRL));
             uart_puts("\n");
         }
 
@@ -397,9 +423,19 @@ static int run_chained_model(test_case_t *tc) {
             if (ret == -1) {
                 uart_puts(": ERROR (status=0x");
                 uart_put_hex32(NPU_REG(REG_STATUS));
+                uart_puts(" irq=0x");
+                uart_put_hex32(NPU_REG(REG_IRQ_STATUS));
+                uart_puts(" code=0x");
+                uart_put_hex32(NPU_REG(REG_ERROR_CODE));
                 uart_puts(")\n");
             } else {
-                uart_puts(": TIMEOUT\n");
+                uart_puts(": TIMEOUT (status=0x");
+                uart_put_hex32(NPU_REG(REG_STATUS));
+                uart_puts(" irq=0x");
+                uart_put_hex32(NPU_REG(REG_IRQ_STATUS));
+                uart_puts(" code=0x");
+                uart_put_hex32(NPU_REG(REG_ERROR_CODE));
+                uart_puts(")\n");
             }
             return -1;
         }
@@ -407,19 +443,36 @@ static int run_chained_model(test_case_t *tc) {
         /* Flush DCache so CPU reads DMA-written DDR output (not stale cache) */
         dcache_flush();
 
-        /* Verify output: compare DDR at ddr_out_addr vs golden.
-         * In chain mode (RUN_MODEL_B), intermediate layer golden is based on
-         * pre-packed input, not chain input. Only verify L0 and last layer. */
+        /* Verify: workspace was poison, not golden. A layer that did not
+         * run used to PASS because ddr_out already held the expected words. */
         uint32_t n_output = e[3];
-#ifdef RUN_MODEL_B
-        int skip_verify = 0;  /* Debug: verify all layers to find bugs */
-#else
-        int skip_verify = 0;
-#endif
-        if (n_output > 0 && !skip_verify) {
-            const uint32_t *golden = cursor + LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2];
-            volatile const uint32_t *out_ptr = (volatile const uint32_t *)(uintptr_t)e[31];
+        const uint32_t *golden = cursor + LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2];
+        volatile const uint32_t *out_ptr = (volatile const uint32_t *)(uintptr_t)e[31];
+        int layer_err = 0;
+        int poison_left = 0;
 
+        uart_puts("  PERF_L");
+        uart_put_dec(l);
+        uart_puts(" npu=");
+        uart_put_dec(perf_npu);
+        uart_puts(" mac=");
+        uart_put_dec(perf_macs);
+        uart_puts("\n");
+
+        if (perf_npu == 0) {
+            uart_puts("  L");
+            uart_put_dec(l);
+            uart_puts(": FAIL — npu busy cycles=0 (layer did not run)\n");
+            layer_err++;
+        }
+
+        if (n_output == 0) {
+            if (layer_err == 0) {
+                uart_puts("  L");
+                uart_put_dec(l);
+                uart_puts(": PASS (empty output buffer, DDR compare omitted)\n");
+            }
+        } else {
             /* Debug: for layer 0-2, print first 5 output words vs golden */
             if (l < 3) {
                 uart_puts("  DBG L"); uart_put_dec(l);
@@ -436,7 +489,6 @@ static int run_chained_model(test_case_t *tc) {
                     uart_puts("\n");
                 }
             }
-            int layer_err = 0;
             if (op_type == 7) {
                 /* Concat: verify only the channels this phase owns.
                  * concat_cfg = (total_c << 16) | offset; owned ch range is
@@ -474,25 +526,34 @@ static int run_chained_model(test_case_t *tc) {
                     if (++ch == out_c) ch = 0;
                 }
             } else {
-            for (uint32_t i = 0; i < n_output; i++) {
-                if (out_ptr[i] != golden[i]) {
-            if (layer_err < 10) {
-                    uart_puts("  L");
-                    uart_put_dec(l);
-                    uart_puts(" w[");
-                    uart_put_dec(i);
-                    uart_puts("]: exp=0x");
-                    uart_put_hex32(golden[i]);
-                    uart_puts(" got=0x");
-                    uart_put_hex32(out_ptr[i]);
-                    uart_putc('\n');
+                for (uint32_t i = 0; i < n_output; i++) {
+                    if (out_ptr[i] == OUT_POISON && golden[i] != OUT_POISON)
+                        poison_left++;
+                    if (out_ptr[i] != golden[i]) {
+                        if (layer_err < 10) {
+                            uart_puts("  L");
+                            uart_put_dec(l);
+                            uart_puts(" w[");
+                            uart_put_dec(i);
+                            uart_puts("]: exp=0x");
+                            uart_put_hex32(golden[i]);
+                            uart_puts(" got=0x");
+                            uart_put_hex32(out_ptr[i]);
+                            uart_putc('\n');
+                        }
+                        layer_err++;
+                    }
                 }
-                    layer_err++;
-                }
-            }
             }
 
-            if (layer_err == 0) {
+            if (poison_left) {
+                uart_puts("  L");
+                uart_put_dec(l);
+                uart_puts(": FAIL — ");
+                uart_put_dec(poison_left);
+                uart_puts(" poison words not overwritten\n");
+            }
+            if (layer_err == 0 && poison_left == 0) {
                 uart_puts("  L");
                 uart_put_dec(l);
                 uart_puts(": PASS (");
@@ -506,27 +567,11 @@ static int run_chained_model(test_case_t *tc) {
                 uart_puts("/");
                 uart_put_dec(n_output);
                 uart_puts(" mismatches\n");
-                total_err += layer_err;
+                total_err += layer_err + poison_left;
             }
-            /* Perf: NPU busy cycles + MAC issues (from HW counters) */
-            {
-                uart_puts("  PERF_L");
-                uart_put_dec(l);
-                uart_puts(" npu=");
-                uart_put_dec(perf_npu);
-                uart_puts(" mac=");
-                uart_put_dec(perf_macs);
-                uart_puts("\n");
-            }
-        } else if (skip_verify) {
-            uart_puts("  L");
-            uart_put_dec(l);
-            uart_puts(": SKIP (chain mode, golden mismatch expected)\n");
-        } else {
-            uart_puts("  L");
-            uart_put_dec(l);
-            uart_puts(": (no golden output, skipped verification)\n");
         }
+        if (n_output == 0 && layer_err)
+            total_err += layer_err;
 
         /* Advance cursor */
         cursor += LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2] + e[3];

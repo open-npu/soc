@@ -114,6 +114,8 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         n_in  = len(d['input']) if (i == 0 or i == standalone_layer) else 0
         n_out = len(d['output'])
         dma_out = m.get('dma_out_size', 0)
+        # Fused intermediates may have empty golden npy but still need a
+        # runtime OUT buffer so the next tiled layer can 2D-load them.
         out_bytes = max(n_out * 4, dma_out)
         ddr_in = ddr_wgt = ddr_param = ddr_out = 0
         if n_in > 0:
@@ -122,7 +124,7 @@ def build_chained_blob(meta, data, standalone_layer=-1):
             ddr_wgt = cur; cur += _align(n_wgt * 4)
         if n_param > 0:
             ddr_param = cur; cur += _align(n_param * 4)
-        if n_out > 0:
+        if out_bytes > 0:
             ddr_out = cur; cur += _align(out_bytes)
         alloc.append((ddr_in, ddr_wgt, ddr_param, ddr_out))
 
