@@ -10,3 +10,7 @@ sim/*.init
 sim/*.log
 sim/obj_dir/
 sim/Vsim
+sim/core.*
+build/
+**/__pycache__/
+litex/build/
