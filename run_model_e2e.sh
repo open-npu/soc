@@ -5,7 +5,7 @@ set -euo pipefail
 
 MODEL="${1:?usage: $0 model_b_int16}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-GEN="$ROOT/tools/gen/${MODEL}_golden.py"
+GEN="$ROOT/tools/internal/gen/${MODEL}_golden.py"
 LOG="$ROOT/soc/sim/sim_${MODEL}_accept.log"
 
 if [[ ! -f "$GEN" ]]; then
