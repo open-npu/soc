@@ -85,6 +85,30 @@
  * Workspace DDR outputs are initialized to this, not golden. */
 #define OUT_POISON      0xDEADBEEFu
 
+/* sched_ctrl bits (model descriptor, programmed into DMA_CTRL). */
+#define SCHED_DB_EN         (1U << 0)
+#define SCHED_FUSE_START    (1U << 1)
+#define SCHED_FUSE_MID      (1U << 2)
+#define SCHED_FUSE_END      (1U << 3)
+#define SCHED_FUSE_MASK     (SCHED_FUSE_START | SCHED_FUSE_MID | SCHED_FUSE_END)
+
+/* HW_CONFIG (0x018). npu_csr currently packs SPAD_KB in [23:16] as kilobytes,
+ * not 4KB units. Act SRAM depth matches rtl/src/npu_top.v:
+ *   ACT_DEPTH_WORDS = SPAD_KB * 64
+ * When the register encoding or the Act/Wgt/Param split changes, update
+ * npu_hw_probe() / npu_act_words_from_spad_kb() only — fusion decisions
+ * go through g_act_words. Compile with -DNPU_SPAD_KB_OVERRIDE=N to pin
+ * a size without reading the CSR. */
+#ifndef NPU_SPAD_KB_OVERRIDE
+#define NPU_SPAD_KB_OVERRIDE 0
+#endif
+#define HW_CFG_ARRAY_SIZE(v) ((v) & 0xFFu)
+#define HW_CFG_SPAD_KB(v)    (((v) >> 16) & 0xFFu)
+#define NPU_SPAD_KB_DEFAULT  192u
+
+static uint32_t g_spad_kb;
+static uint32_t g_act_words;
+
 /* ═══════════════════════════════════════════════════════════════════
  *  UART helpers
  *  ═══════════════════════════════════════════════════════════════════ */
@@ -158,6 +182,69 @@ static void memcpy_32(uint32_t dst, const uint32_t *src, uint32_t n_words) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  NPU SRAM geometry (from HW_CONFIG, not a baked-in 192KB)
+ *  ═══════════════════════════════════════════════════════════════════ */
+static uint32_t npu_act_words_from_spad_kb(uint32_t spad_kb) {
+    /* rtl/src/npu_top.v: ACT_DEPTH = SPAD_KB * 64 (32-bit words). */
+    return spad_kb * 64u;
+}
+
+static void npu_hw_probe(void) {
+    uint32_t hwcfg = NPU_REG(REG_HW_CONFIG);
+    uint32_t spad = NPU_SPAD_KB_OVERRIDE ? (uint32_t)NPU_SPAD_KB_OVERRIDE
+                                         : HW_CFG_SPAD_KB(hwcfg);
+    if (spad == 0)
+        spad = NPU_SPAD_KB_DEFAULT;
+    g_spad_kb = spad;
+    g_act_words = npu_act_words_from_spad_kb(spad);
+}
+
+static uint16_t layer_tile_h(const uint32_t *e) {
+    return (uint16_t)(e[19] & 0xFFFFu);
+}
+
+static uint32_t layer_out_base(const uint32_t *e) {
+    /* Tiled: tile_in_size/4. Untiled: full dma_in_size/4. */
+    return (e[23] > 0) ? (e[23] / 4u) : (e[15] / 4u);
+}
+
+static uint32_t layer_in_words(const uint32_t *e) {
+    return e[15] / 4u;
+}
+
+static uint32_t layer_out_words(const uint32_t *e) {
+    return e[17] / 4u;
+}
+
+/* SRAM reuse is only valid when both layers are untiled (RTL skip_act_load
+ * requires tile_h==0) AND the tensors fit in the live Act SRAM. Mixed
+ * tiled START + untiled MID (D8 L16→L17) falls back to DDR. A later
+ * untiled FUSE_END can still reuse SRAM after that DDR-loaded MID. */
+static int sram_fuse_reuse(const uint32_t *prev, const uint32_t *cur) {
+    uint32_t ps, cs, act_base, need_in, need_out, cap;
+    if (!prev || !cur || g_act_words == 0)
+        return 0;
+    if (layer_tile_h(prev) != 0 || layer_tile_h(cur) != 0)
+        return 0;
+    ps = prev[21];
+    cs = cur[21];
+    if ((ps & (SCHED_FUSE_START | SCHED_FUSE_MID)) == 0)
+        return 0;
+    if ((cs & (SCHED_FUSE_MID | SCHED_FUSE_END)) == 0)
+        return 0;
+    act_base = layer_out_base(prev);
+    need_in  = act_base + layer_in_words(cur);
+    need_out = layer_out_base(cur) + layer_out_words(cur);
+    cap = g_act_words;
+    /* DB_EN confines each bank to half of Act SRAM. */
+    if ((cs & SCHED_DB_EN) || (ps & SCHED_DB_EN))
+        cap = g_act_words / 2u;
+    if (need_in > cap || need_out > cap)
+        return 0;
+    return 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  NPU helpers
  *  ═══════════════════════════════════════════════════════════════════ */
 static void npu_reset(void) {
@@ -195,15 +282,16 @@ static int npu_wait_done(void) {
  *   act_base: SRAM word address to read activations from.
  *             0 for a normal DDR load; previous layer's out_base for
  *             non-tiled FUSE_MID/END (skip_act_load).
+ *   dma_ctrl: sched_ctrl with FUSE bits kept only when SRAM reuse is safe.
  */
 static void npu_program_layer(const uint32_t *e,
                               uint32_t runtime_in_addr,
                               uint32_t runtime_add_b_addr,
-                              uint32_t act_base) {
+                              uint32_t act_base,
+                              uint32_t dma_ctrl) {
     uint32_t op_type   = e[4];
     uint32_t data_type = e[5];
     uint32_t in_zp     = e[28];
-    uint32_t sched     = e[21];
 
     /* Layer mode: op_type | data_type | in_zp */
     NPU_REG(REG_LAYER_MODE) = (op_type & 0xF) | ((data_type & 1) << 4)
@@ -278,13 +366,9 @@ static void npu_program_layer(const uint32_t *e,
     }
     NPU_REG(REG_DMA_OUT_STRIDE) = 0;
 
-    /* DMA control: keep DB_EN/PTS. Drop FUSE_START/MID/END so RTL always
-     * DMA-loads and stores. Non-tiled L17/L18 SRAM reuse (act_base) still
-     * produced a fully-wrong L19; mixed tiled-then-untiled fuse is unsafe.
-     *
-     * Do not clear DB_EN here: npu_ctrl only walks tiles / PTS when db_en=1.
-     * Oversized fused tiles must be refit in the golden generator. */
-    NPU_REG(REG_DMA_CTRL) = sched & ~0x0Eu;
+    /* DMA control: keep DB_EN/PTS. Keep FUSE_* only when the caller decided
+     * SRAM reuse is safe (dma_ctrl already stripped otherwise). */
+    NPU_REG(REG_DMA_CTRL) = dma_ctrl;
 
     /* Post-processing */
     NPU_REG(REG_POST_CTRL)      = e[13];
@@ -306,6 +390,9 @@ static int run_chained_model(test_case_t *tc) {
     uart_puts(tc->name);
     uart_puts("\n  ----------------------------------------\n");
 
+    if (g_act_words == 0)
+        npu_hw_probe();
+
     volatile const uint32_t *blob = (volatile const uint32_t *)(uintptr_t)tc->blob_base;
     uint32_t magic = blob[0];
     uint32_t num_layers = blob[1];
@@ -321,12 +408,14 @@ static int run_chained_model(test_case_t *tc) {
     uart_put_dec(num_layers);
     uart_putc('\n');
 
-    /* First pass: build layer_out_addr[] for skip/residual lookup */
+    /* First pass: layer pointers + skip/residual lookup */
     uint32_t layer_out_addr[MAX_LAYERS];
+    const uint32_t *layer_e[MAX_LAYERS];
     const uint32_t *cursor = blob + 3;  /* skip 3-word blob header */
 
     for (uint32_t l = 0; l < num_layers && l < MAX_LAYERS; l++) {
         const uint32_t *e = cursor;
+        layer_e[l] = e;
         layer_out_addr[l] = e[31];  /* ddr_out_addr */
 
         /* Advance cursor past header + wgt + param + input + output */
@@ -343,6 +432,18 @@ static int run_chained_model(test_case_t *tc) {
 
     for (uint32_t l = 0; l < num_layers; l++) {
         const uint32_t *e = cursor;
+        const uint32_t *prev = (l > 0) ? layer_e[l - 1] : 0;
+        const uint32_t *next = (l + 1 < num_layers) ? layer_e[l + 1] : 0;
+        int reuse = sram_fuse_reuse(prev, e);
+        /* Keep FUSE_START on an untiled producer only if the next layer
+         * will actually skip_act_load. Otherwise START must store to DDR. */
+        int keep_fuse = reuse;
+        if (!keep_fuse && next && (e[21] & SCHED_FUSE_START) && layer_tile_h(e) == 0
+            && sram_fuse_reuse(e, next))
+            keep_fuse = 1;
+        uint32_t dma_ctrl = keep_fuse ? e[21] : (e[21] & ~SCHED_FUSE_MASK);
+        int skip_store = keep_fuse && layer_tile_h(e) == 0
+                         && (e[21] & (SCHED_FUSE_START | SCHED_FUSE_MID));
 
         uint32_t op_type = e[4];
         int32_t input_src = (int32_t)e[34];
@@ -381,31 +482,26 @@ static int run_chained_model(test_case_t *tc) {
             runtime_add_b_addr = e[33];  /* fallback: metadata's ddr_add_b_addr */
         }
 
-        /* Always soft-reset between layers. Mixed tiled→untiled fuse cannot
-         * reuse SRAM (L16 out at word 1568 overlaps L17 out at 3136), and
-         * DMA_CTRL strips FUSE bits so every layer DMA-loads to SRAM[0].
-         * Skipping reset here used to preserve SRAM; that path is gone. */
-        if (l > 0) {
+        /* Preserve Act SRAM across FUSE_MID/END. Soft-reset otherwise so a
+         * mixed tiled→untiled block cannot read a stale tiled layout. */
+        if (l > 0 && !reuse) {
             NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
             for (volatile int d = 0; d < 100; d++) {}
         }
         NPU_REG(REG_IRQ_STATUS) = 0x7;  /* always W1C before START */
 
-        /* DMA load always writes SRAM[0]; compute must read from 0.
-         * The old act_base=prev_out for non-tiled FUSE_MID/END pointed at
-         * L16's SRAM output while the fresh DDR load sat at address 0. */
-        uint32_t act_base = 0;
+        uint32_t act_base = reuse ? layer_out_base(prev) : 0;
 
-        npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, act_base);
+        npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, act_base, dma_ctrl);
         dcache_flush();
-        if (l < 3 || (l >= 15 && l <= 19)) {
+        if (l < 3 || (e[21] & SCHED_FUSE_MASK)) {
             uart_puts("  DBG L"); uart_put_dec(l);
             uart_puts(": in_addr=0x"); uart_put_hex32(runtime_in_addr);
             uart_puts(" e32=0x"); uart_put_hex32(e[32]);
             uart_puts(" in_stride=0x"); uart_put_hex32(NPU_REG(0x110));
             uart_puts(" act_base="); uart_put_dec(act_base);
             uart_puts(" dma_ctrl=0x"); uart_put_hex32(NPU_REG(REG_DMA_CTRL));
-            uart_puts("\n");
+            uart_puts(reuse ? " SRAM_FUSE\n" : "\n");
         }
 
         /* Start NPU */
@@ -466,7 +562,15 @@ static int run_chained_model(test_case_t *tc) {
             layer_err++;
         }
 
-        if (n_output == 0) {
+        if (skip_store) {
+            if (layer_err == 0) {
+                uart_puts("  L");
+                uart_put_dec(l);
+                uart_puts(": PASS (SRAM fuse, DDR store skipped)\n");
+            } else {
+                total_err += layer_err;
+            }
+        } else if (n_output == 0) {
             if (layer_err == 0) {
                 uart_puts("  L");
                 uart_put_dec(l);
@@ -570,7 +674,7 @@ static int run_chained_model(test_case_t *tc) {
                 total_err += layer_err + poison_left;
             }
         }
-        if (n_output == 0 && layer_err)
+        if (!skip_store && n_output == 0 && layer_err)
             total_err += layer_err;
 
         /* Advance cursor */
@@ -597,10 +701,15 @@ void main(void) {
     uart_put_dec(ver & 0xFF);
     uart_putc('\n');
 
+    npu_hw_probe();
     uint32_t hwcfg = NPU_REG(REG_HW_CONFIG);
     uart_puts("      Array size: ");
-    uart_put_dec(hwcfg & 0xFF);
-    uart_puts(", HW config: 0x");
+    uart_put_dec(HW_CFG_ARRAY_SIZE(hwcfg));
+    uart_puts(", SPAD ");
+    uart_put_dec(g_spad_kb);
+    uart_puts("KB, Act SRAM ");
+    uart_put_dec(g_act_words);
+    uart_puts(" words, HW config: 0x");
     uart_put_hex32(hwcfg);
     uart_putc('\n');
 
@@ -669,7 +778,7 @@ void main(void) {
 
         /* Program NPU — use full npu_program_layer for tiling support */
         npu_reset();
-        npu_program_layer(e24, in_addr, 0, 0);
+        npu_program_layer(e24, in_addr, 0, 0, e24[21] & ~SCHED_FUSE_MASK);
         /* Override output address */
         NPU_REG(REG_DMA_OUT_ADDR) = out_addr;
         dcache_flush();
