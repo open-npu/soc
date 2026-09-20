@@ -217,8 +217,11 @@ static uint32_t layer_out_words(const uint32_t *e) {
 }
 
 /* SRAM reuse is only valid when both layers are untiled (RTL skip_act_load
- * requires tile_h==0) AND the tensors fit in the live Act SRAM. Mixed
- * tiled START + untiled MID (D8 L16→L17) falls back to DDR. A later
+ * requires tile_h==0) AND the tensors fit in the live Act SRAM.
+ * Converter now stamps one large tile grid on each IR (1×1→DW→1×1 [+Add]).
+ * Tiled same-grid still cannot skip DMA: compute finishes all tiles of
+ * START before MID starts, so only the last tile would remain in SRAM.
+ * Mixed tiled START + untiled MID (D8 L16→L17) falls back to DDR. A later
  * untiled FUSE_END can still reuse SRAM after that DDR-loaded MID. */
 static int sram_fuse_reuse(const uint32_t *prev, const uint32_t *cur) {
     uint32_t ps, cs, act_base, need_in, need_out, cap;
