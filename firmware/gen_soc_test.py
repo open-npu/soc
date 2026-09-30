@@ -42,8 +42,8 @@ DDR_REMAP_OFFSET = MODEL_DDR_BASE - 0x30000000  # metadata 0x30000000 → 0x4020
 
 # ── Binary blob format ──
 MAGIC = 0x4E505532  # "NPU2"
-LAYER_ENTRY_HDR_WORDS = 36
-LAYER_ENTRY_HDR_SIZE = LAYER_ENTRY_HDR_WORDS * 4  # 144 bytes
+LAYER_ENTRY_HDR_WORDS = 37
+LAYER_ENTRY_HDR_SIZE = LAYER_ENTRY_HDR_WORDS * 4  # 148 bytes
 
 
 def pack_u32(v):
@@ -171,6 +171,7 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         in_zp = m.get('in_zp', 0)
         input_src = m.get('input_src', -1)
         residual_src = m.get('residual_src', -1)
+        wgt_layout = m.get('wgt_layout', 0)
 
         # cfg_aux: operator-specific config
         cfg_aux = 0
@@ -183,7 +184,7 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         elif m['op_type'] == 7:  # Concat
             cfg_aux = m.get('concat_cfg', 0)
 
-        # Write 36-word header
+        # Write 37-word header
         hdr = [
             n_wgt,              # [0]
             n_param,            # [1]
@@ -221,6 +222,7 @@ def build_chained_blob(meta, data, standalone_layer=-1):
             ddr_add_b,          # [33]
             input_src & 0xFFFFFFFF,   # [34] -1 → 0xFFFFFFFF
             residual_src & 0xFFFFFFFF,  # [35] -1 → 0xFFFFFFFF
+            wgt_layout,         # [36] 0=OC-major, 1=K-major (64-lane row)
         ]
         for w in hdr:
             buf += pack_u32(w)
@@ -291,6 +293,7 @@ def generate_header(model_name, blob_size):
         f.write("    uint32_t ddr_add_b_addr;   /* [33] */\n")
         f.write("    int32_t  input_src;        /* [34] -1=chain, N=skip */\n")
         f.write("    int32_t  residual_src;     /* [35] -1=none, N=branch B */\n")
+        f.write("    uint32_t wgt_layout;       /* [36] 0=OC-major, 1=K-major */\n")
         f.write("} __attribute__((packed)) layer_entry_t;\n\n")
 
         f.write(f"#define LAYER_ENTRY_HDR_SIZE  {LAYER_ENTRY_HDR_SIZE}\n")
