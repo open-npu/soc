@@ -64,6 +64,7 @@
 #define REG_DMA_STORE_MODE  0x140
 #define REG_DMA_ROW_CFG     0x144
 #define REG_DMA_WGT_PER_OC  0x148
+#define REG_WGT_LAYOUT      0x14C
 #define REG_POST_CTRL       0x180
 #define REG_POST_PARAM_CNT  0x188
 #define REG_POST_CLAMP      0x18C
@@ -342,6 +343,11 @@ static void npu_program_layer(const uint32_t *e,
 
     /* Per-OC weight reload */
     NPU_REG(REG_DMA_WGT_PER_OC) = e[26];
+
+    /* Weight blob layout: selects the 64-lane row (K-major) vs the systolic
+     * array (OC-major). Must be written every layer; a stale 1 would point
+     * the row at an OC-major blob. */
+    NPU_REG(REG_WGT_LAYOUT) = e[36];
 
     /* Tiled DB_EN prefetch + PTS 2D DMA */
     if (e[23] > 0) NPU_REG(REG_DMA_TILE_IN_SIZE) = e[23];
