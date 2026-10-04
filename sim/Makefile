@@ -13,8 +13,11 @@ OBJ_DIR     = obj_dir
 NPU_SRCS = $(NPU_RTL_DIR)/npu_pe.v \
            $(NPU_RTL_DIR)/npu_systolic.v \
            $(NPU_RTL_DIR)/npu_ppu.v \
+           $(NPU_RTL_DIR)/npu_ppu_bank.v \
+           $(NPU_RTL_DIR)/npu_dw_bank.v \
            $(NPU_RTL_DIR)/npu_csr.v \
            $(NPU_RTL_DIR)/npu_sram.v \
+           $(NPU_RTL_DIR)/npu_sram_wide.v \
            $(NPU_RTL_DIR)/npu_dma.v \
            $(NPU_RTL_DIR)/npu_dw_conv.v \
            $(NPU_RTL_DIR)/npu_ctrl.v \
