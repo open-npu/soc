@@ -17,7 +17,7 @@ MAIN_RAM_BASE = 0x40000000
 BLOB_BASE = 0x40010000      # blob header + layer entries at 64KB offset
 
 MAGIC = 0x4E505532
-LAYER_ENTRY_HDR_WORDS = 36
+LAYER_ENTRY_HDR_WORDS = 37
 # Runtime DDR output workspace. Must not be pre-filled with golden: an NPU
 # that never stores would then compare equal and report a false PASS.
 OUT_POISON = 0xDEADBEEF
@@ -37,7 +37,7 @@ def bin_to_words(data):
 def parse_blob(blob_words):
     """Parse chained blob into layer entries with DDR addresses.
 
-    Returns list of dicts: [{header: [36 words], wgt: [], param: [], input: [], output: []}]
+    Returns list of dicts: [{header: [37 words], wgt: [], param: [], input: [], output: []}]
     """
     magic = blob_words[0]
     if magic != MAGIC:
@@ -48,6 +48,8 @@ def parse_blob(blob_words):
 
     offset = 3  # skip 3-word blob header
     for l in range(num_layers):
+        if offset + LAYER_ENTRY_HDR_WORDS > len(blob_words):
+            raise ValueError(f"Layer {l}: truncated {LAYER_ENTRY_HDR_WORDS}-word header")
         hdr = blob_words[offset:offset + LAYER_ENTRY_HDR_WORDS]
         offset += LAYER_ENTRY_HDR_WORDS
 
@@ -55,6 +57,12 @@ def parse_blob(blob_words):
         n_param = hdr[1]
         n_input = hdr[2]
         n_output = hdr[3]
+        payload_words = n_wgt + n_param + n_input + n_output
+        if offset + payload_words > len(blob_words):
+            raise ValueError(
+                f"Layer {l}: payload needs {payload_words} words, "
+                f"only {len(blob_words) - offset} remain"
+            )
 
         wgt = blob_words[offset:offset + n_wgt]
         offset += n_wgt
@@ -79,6 +87,9 @@ def parse_blob(blob_words):
             'ddr_out': hdr[31],
             'ddr_in': hdr[32],
         })
+
+    if offset != len(blob_words):
+        raise ValueError(f"Blob has {len(blob_words) - offset} trailing words")
 
     return layers
 

@@ -50,9 +50,14 @@ ifeq ($(findstring model_e,$(MODEL)),model_e)
 DEFINES += -DRUN_MODEL_E
 endif
 
-# Generate test data header and binary blob together
-$(TEST_DATA_H) $(TEST_DATA_BIN):
+# Generate both artifacts on every build. MODEL and STANDALONE_LAYER are make
+# variables rather than files, so timestamp-only dependencies can otherwise
+# silently reuse a blob generated for a different model.
+$(TEST_DATA_BIN): FORCE gen_soc_test.py
 	python3 gen_soc_test.py --model $(MODEL) --standalone-layer $(STANDALONE_LAYER)
+
+$(TEST_DATA_H): $(TEST_DATA_BIN)
+	@test -f $@
 
 %.o: %.c $(TEST_DATA_H)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -84,4 +89,5 @@ $(MAIN_RAM_INIT): $(TARGET).bin $(TEST_DATA_BIN) build_main_ram.py
 clean:
 	rm -f *.o *.elf *.bin *.hex *.dis $(TEST_DATA_BIN) $(MAIN_RAM_INIT) $(TEST_DATA_H)
 
-.PHONY: all clean
+.PHONY: all clean FORCE
+FORCE:

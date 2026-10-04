@@ -93,19 +93,21 @@
 #define SCHED_FUSE_END      (1U << 3)
 #define SCHED_FUSE_MASK     (SCHED_FUSE_START | SCHED_FUSE_MID | SCHED_FUSE_END)
 
-/* HW_CONFIG (0x018). npu_csr currently packs SPAD_KB in [23:16] as kilobytes,
- * not 4KB units. Act SRAM depth matches rtl/src/npu_top.v:
- *   ACT_DEPTH_WORDS = SPAD_KB * 64
- * When the register encoding or the Act/Wgt/Param split changes, update
- * npu_hw_probe() / npu_act_words_from_spad_kb() only — fusion decisions
- * go through g_act_words. Compile with -DNPU_SPAD_KB_OVERRIDE=N to pin
- * a size without reading the CSR. */
+/* HW_CONFIG (0x018) [23:16] is the total on-chip SRAM in KB
+ * (IFM 24 + OFM 48 + weight 80 + param 12 = 164). Fusion swaps the
+ * two activation banks, so the live cap is the smaller one: IFM,
+ * 24KB = 6144 words. DB_EN halves that in sram_fuse_reuse.
+ * Compile with -DNPU_IFM_KB_OVERRIDE=N to pin the IFM size. */
 #ifndef NPU_SPAD_KB_OVERRIDE
 #define NPU_SPAD_KB_OVERRIDE 0
 #endif
+#ifndef NPU_IFM_KB_OVERRIDE
+#define NPU_IFM_KB_OVERRIDE 0
+#endif
 #define HW_CFG_ARRAY_SIZE(v) ((v) & 0xFFu)
 #define HW_CFG_SPAD_KB(v)    (((v) >> 16) & 0xFFu)
-#define NPU_SPAD_KB_DEFAULT  192u
+#define NPU_SPAD_KB_DEFAULT  164u
+#define NPU_IFM_KB           24u
 
 static uint32_t g_spad_kb;
 static uint32_t g_act_words;
@@ -153,9 +155,12 @@ static inline void dcache_inval_addr(void *addr) {
     asm volatile(".word 0x003b" : : "r"(addr) : "memory");
 }
 /* Invalidate a range of DDR addresses (force CPU to re-read from DDR). */
-static void dcache_inval_range(volatile void *ptr, uint32_t size) {
+static __attribute__((unused)) void
+dcache_inval_range(volatile void *ptr, uint32_t size) {
     /* VexRiscv: use flush (0x500F) which also invalidates clean lines.
      * For NPU output, lines are clean (CPU didn't write), so flush = invalidate. */
+    (void)ptr;
+    (void)size;
     dcache_flush();
 }
 
@@ -176,7 +181,8 @@ void *memcpy(void *dst, const void *src, uint32_t n) {
 }
 
 __attribute__((noinline))
-static void memcpy_32(uint32_t dst, const uint32_t *src, uint32_t n_words) {
+static __attribute__((unused)) void
+memcpy_32(uint32_t dst, const uint32_t *src, uint32_t n_words) {
     volatile uint32_t *d = (volatile uint32_t *)dst;
     for (uint32_t i = 0; i < n_words; i++)
         d[i] = src[i];
@@ -186,8 +192,10 @@ static void memcpy_32(uint32_t dst, const uint32_t *src, uint32_t n_words) {
  *  NPU SRAM geometry (from HW_CONFIG, not a baked-in 192KB)
  *  ═══════════════════════════════════════════════════════════════════ */
 static uint32_t npu_act_words_from_spad_kb(uint32_t spad_kb) {
-    /* rtl/src/npu_top.v: ACT_DEPTH = SPAD_KB * 64 (32-bit words). */
-    return spad_kb * 64u;
+    /* Fusion cap is IFM, not total/4. spad_kb is only the CSR total. */
+    (void)spad_kb;
+    return (NPU_IFM_KB_OVERRIDE ? (uint32_t)NPU_IFM_KB_OVERRIDE
+                                : (uint32_t)NPU_IFM_KB) * 256u;
 }
 
 static void npu_hw_probe(void) {
@@ -275,11 +283,11 @@ static int npu_wait_done(void) {
 }
 
 /*
- * npu_program_layer — program ALL CSRs from 36-word layer_entry_t.
+ * npu_program_layer — program ALL CSRs from 37-word layer_entry_t.
  * Mirrors test_npu_dma_e2e.py:program_layer() CSR sequence.
  *
  * Parameters:
- *   e: pointer to 36-word layer entry
+ *   e: pointer to 37-word layer entry
  *   runtime_in_addr: resolved input DDR address (layer 0: from entry[32],
  *                    N>0: producing layer's ddr_out_addr)
  *   runtime_add_b_addr: resolved Add/Concat branch-B DDR address (0 if none)
@@ -350,20 +358,18 @@ static void npu_program_layer(const uint32_t *e,
     NPU_REG(REG_WGT_LAYOUT) = e[36];
 
     /* Tiled DB_EN prefetch + PTS 2D DMA */
-    if (e[23] > 0) NPU_REG(REG_DMA_TILE_IN_SIZE) = e[23];
+    NPU_REG(REG_DMA_TILE_IN_SIZE) = e[23];
     /* STORE_MODE must be written unconditionally — in a chained run a stale
      * PTS_EN=1 from a previous tiled layer would otherwise divert a non-PTS
      * layer's final store to the S_TILE_STORE path with the wrong source
      * address (hit by model_a L61 after L60: output read back as zeros). */
     NPU_REG(REG_DMA_STORE_MODE)    = e[22];
-    if (e[22] > 0) {
-        NPU_REG(REG_DMA_TILE_OUT_SIZE) = e[24];
-        NPU_REG(REG_DMA_ROW_CFG)       = e[25];
-    }
+    NPU_REG(REG_DMA_TILE_OUT_SIZE) = e[24];
+    NPU_REG(REG_DMA_ROW_CFG)       = e[25];
 
     /* Strides: in_stride = in_w * in_c * elem_bytes for 2D tiled load (chain mode) */
     {
-        uint32_t in_w = e[6] >> 16;
+        uint32_t in_w = e[6] & 0xFFFF;  /* IN_DIM_HW[15:0] = W */
         uint32_t in_c = e[7];
         uint32_t eb = (e[5] & 1) ? 2 : 1;
         /* Set in_stride for tiled layers when input is NHWC (chain mode).
@@ -402,7 +408,7 @@ static int run_chained_model(test_case_t *tc) {
     if (g_act_words == 0)
         npu_hw_probe();
 
-    volatile const uint32_t *blob = (volatile const uint32_t *)(uintptr_t)tc->blob_base;
+    const uint32_t *blob = (const uint32_t *)(uintptr_t)tc->blob_base;
     uint32_t magic = blob[0];
     uint32_t num_layers = blob[1];
 
@@ -410,6 +416,12 @@ static int run_chained_model(test_case_t *tc) {
         uart_puts("  BLOB MAGIC MISMATCH: 0x");
         uart_put_hex32(magic);
         uart_puts("\n  SKIP\n");
+        return -1;
+    }
+    if (num_layers > MAX_LAYERS) {
+        uart_puts("  TOO MANY LAYERS: ");
+        uart_put_dec(num_layers);
+        uart_putc('\n');
         return -1;
     }
 
@@ -422,7 +434,7 @@ static int run_chained_model(test_case_t *tc) {
     const uint32_t *layer_e[MAX_LAYERS];
     const uint32_t *cursor = blob + 3;  /* skip 3-word blob header */
 
-    for (uint32_t l = 0; l < num_layers && l < MAX_LAYERS; l++) {
+    for (uint32_t l = 0; l < num_layers; l++) {
         const uint32_t *e = cursor;
         layer_e[l] = e;
         layer_out_addr[l] = e[31];  /* ddr_out_addr */

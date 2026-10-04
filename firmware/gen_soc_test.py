@@ -4,7 +4,7 @@ Generate SoC firmware test data for chained model inference.
 
 Reads golden .npy files and metadata.json for model_a/b/c/d INT16,
 produces:
-  - test_data.bin     — binary blob with 36-word layer_entry_t headers
+  - test_data.bin     — binary blob with 37-word layer_entry_t headers
   - soc_test_data.h   — C header with blob format and model base address
 
 Chained inference: Layer N output in DDR becomes Layer N+1 input.
@@ -91,7 +91,7 @@ def remap_ddr(addr):
 def build_chained_blob(meta, data, standalone_layer=-1):
     """Build binary blob bytes for chained model inference.
 
-    Each layer has 36-word header + wgt + param + input(L0 only) + golden output.
+    Each layer has 37-word header + wgt + param + input(L0 only) + golden output.
     DDR addresses are remapped from 0x30XXXXXX to 0x40XXXXXX.
     """
     # ─── Re-allocate DDR regions non-overlapping ───
@@ -134,7 +134,7 @@ def build_chained_blob(meta, data, standalone_layer=-1):
     buf += pack_u32(1)  # version
 
     for i, (m, d) in enumerate(zip(meta, data)):
-        # Build 36-word header
+        # Build 37-word header
         wgt = d['wgt']
         param = d['param']
         inp = d['input']
@@ -153,8 +153,9 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         ddr_add_b = remap_ddr(m.get('ddr_add_b_addr', 0))
 
         # Pack fields
-        in_hw = m['in_h'] | (m['in_w'] << 16)
-        out_hw = m['out_h'] | (m['out_w'] << 16)
+        # RTL decodes W from [15:0] and H from [31:16].
+        in_hw = m['in_w'] | (m['in_h'] << 16)
+        out_hw = m['out_w'] | (m['out_h'] << 16)
         kernel_dil = m['kernel_h'] | (m['kernel_w'] << 8)
         stride = m['stride_h'] | (m['stride_w'] << 8)
         padding = m.get('pad_top', 0) | (m.get('pad_left', 0) << 8)
@@ -171,6 +172,10 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         in_zp = m.get('in_zp', 0)
         input_src = m.get('input_src', -1)
         residual_src = m.get('residual_src', -1)
+        # Checked-in SoC goldens (model_a/model_e) omit wgt_layout and store
+        # conv weights OC-major. A missing key stays on the mesh. K-major
+        # blobs must set the key; the e2e harness default of 1 is for a
+        # different suite and mis-reads these bytes.
         wgt_layout = m.get('wgt_layout', 0)
 
         # cfg_aux: operator-specific config
@@ -255,7 +260,7 @@ def generate_header(model_name, blob_size):
         f.write(f"#define BLOB_MODEL_BASE  0x{blob_base:08X}\n")
         f.write(f"#define BLOB_MODEL_SIZE  {blob_size}\n\n")
 
-        f.write("/* Per-layer blob entry header (36 uint32 words = 144 bytes) */\n")
+        f.write("/* Per-layer blob entry header (37 uint32 words = 148 bytes) */\n")
         f.write("typedef struct {\n")
         f.write("    uint32_t n_wgt;            /* [0]  */\n")
         f.write("    uint32_t n_param;          /* [1]  */\n")
@@ -311,18 +316,63 @@ def generate_header(model_name, blob_size):
     print(f"Generated {HEADER_FILE}")
 
 
+def self_test():
+    """Check the binary ABI without requiring model golden files."""
+    meta = [{
+        'op_type': 0, 'data_type': 1,
+        'in_h': 0x1234, 'in_w': 0x5678, 'in_c': 3,
+        'out_h': 0x2345, 'out_w': 0x6789, 'out_c': 5,
+        'kernel_h': 3, 'kernel_w': 5,
+        'stride_h': 1, 'stride_w': 2,
+        'pad_top': 3, 'pad_left': 4,
+        'post_ctrl': 0x11223344, 'sched_ctrl': 0x55667788,
+        'wgt_layout': 1,
+    }]
+    data = [{
+        'wgt': [0xA1], 'param': [0xB2],
+        'input': [0xC3], 'output': [0xD4],
+    }]
+    blob = build_chained_blob(meta, data)
+    assert len(blob) == 12 + 37 * 4 + 4 * 4
+    magic, layers, version = struct.unpack_from('<III', blob, 0)
+    assert (magic, layers, version) == (MAGIC, 1, 1)
+    hdr = struct.unpack_from('<37I', blob, 12)
+    assert hdr[6] == 0x12345678       # H in high 16, W in low 16
+    assert hdr[8] == 0x23456789
+    assert hdr[10] == 0x00000503
+    assert hdr[11] == 0x00000201
+    assert hdr[12] == 0x00000403
+    assert hdr[13] == 0x11223344
+    assert hdr[21] == 0x55667788
+    assert hdr[36] == 1
+    assert struct.unpack_from('<4I', blob, 12 + 37 * 4) == (
+        0xA1, 0xB2, 0xC3, 0xD4)
+    meta[0].pop('wgt_layout')
+    blob = build_chained_blob(meta, data)
+    hdr = struct.unpack_from('<37I', blob, 12)
+    assert hdr[36] == 0
+    print('gen_soc_test self-test: PASS')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate SoC test data for chained model inference')
-    parser.add_argument('--model', required=True,
-                        choices=['model_a_int16', 'model_a_int8',
-                                 'model_b_int16', 'model_b_int8',
-                                 'model_c_int16', 'model_c_int8',
-                                 'model_d_int16', 'model_d_int8',
-                                 'model_e_int16', 'model_e_int8'],
-                        help='Model to generate')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--model',
+                      choices=['model_a_int16', 'model_a_int8',
+                               'model_b_int16', 'model_b_int8',
+                               'model_c_int16', 'model_c_int8',
+                               'model_d_int16', 'model_d_int8',
+                               'model_e_int16', 'model_e_int8'],
+                      help='Model to generate')
+    mode.add_argument('--self-test', action='store_true',
+                      help='Validate the 37-word binary ABI and exit')
     parser.add_argument('--standalone-layer', type=int, default=-1,
                         help='Also pack input data for this layer (for standalone testing)')
     args = parser.parse_args()
+
+    if args.self_test:
+        self_test()
+        return
 
     print(f"Loading golden data for {args.model}...")
     meta, data = load_model_golden(args.model)
