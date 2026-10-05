@@ -75,8 +75,6 @@ class NPUCore(Module):
 
         # --- Add NPU RTL sources ---
         rtl_files = [
-            "npu_pe.v",
-            "npu_systolic.v",
             "npu_ppu.v",
             "npu_ppu_bank.v",
             "npu_csr.v",
