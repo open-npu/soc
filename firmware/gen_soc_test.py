@@ -45,6 +45,11 @@ MAGIC = 0x4E505532  # "NPU2"
 LAYER_ENTRY_HDR_WORDS = 37
 LAYER_ENTRY_HDR_SIZE = LAYER_ENTRY_HDR_WORDS * 4  # 148 bytes
 
+# The row keeps one 64-channel group in the 80KB weight SRAM.
+WGT_SRAM_BYTES = 80 * 1024
+ROW_LANES = 64
+IFM_DEPTH_WORDS = 24 * 256
+
 
 def pack_u32(v):
     """Pack uint32 to little-endian bytes."""
@@ -86,6 +91,88 @@ def remap_ddr(addr):
     if addr == 0:
         return 0
     return (addr & 0x0FFFFFFF) + MODEL_DDR_BASE
+
+
+def _dw_stream(m):
+    """Match npu_ctrl dw_stream: global depthwise whose activation overflows IFM."""
+    return (m['op_type'] == 1 and m.get('tile_h', 0) == 0
+            and m['kernel_h'] == m['in_h'] and m['kernel_w'] == m['in_w']
+            and m['out_h'] == 1 and m['out_w'] == 1
+            and (m.get('dma_in_size', 0) >> 2) > IFM_DEPTH_WORDS)
+
+
+def _words_to_bytes(wgt):
+    return np.ascontiguousarray(wgt, dtype=np.uint32).tobytes()
+
+
+def _bytes_to_words(blob):
+    if len(blob) % 4:
+        blob = blob + bytes(4 - (len(blob) % 4))
+    return np.frombuffer(blob, dtype=np.uint32).copy()
+
+
+def prepare_row_weights(meta, data):
+    """Rewrite OC-major conv and depthwise blobs into the 64-lane layout.
+
+    Checked-in goldens omit wgt_layout. The row reads K-major, one 64-channel
+    group at a time when the whole layer does not fit the weight SRAM.
+    Global-pool depthwise stays on the streaming engine and keeps its bytes.
+    """
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, 'tools'))
+    from model_packer import (
+        conv_weights_from_blob, conv_weights_to_blob,
+        dw_weights_from_blob, dw_weights_to_blob,
+        WGT_LAYOUT_OC_MAJOR, WGT_LAYOUT_K_MAJOR,
+    )
+    for i, (m, d) in enumerate(zip(meta, data)):
+        op = m['op_type']
+        if op not in (0, 1) or len(d['wgt']) == 0:
+            continue
+        if op == 1 and _dw_stream(m):
+            m['wgt_layout'] = 0
+            print(f"  L{i} depthwise stream stays OC-major")
+            continue
+        es = 2 if m.get('data_type', 0) == 1 else 1
+        dtype = np.int16 if es == 2 else np.int8
+        kh, kw = m['kernel_h'], m['kernel_w']
+        ic, oc = m['in_c'], m['out_c']
+        raw = _words_to_bytes(d['wgt'])
+        if op == 0:
+            expect = oc * kh * kw * ic * es
+            if len(raw) != expect:
+                raise RuntimeError(f"L{i} weight bytes {len(raw)} != {expect}")
+            weights = conv_weights_from_blob(
+                raw, WGT_LAYOUT_OC_MAJOR, oc, kh, kw, ic, dtype)
+            blob = conv_weights_to_blob(weights, WGT_LAYOUT_K_MAJOR, lanes=ROW_LANES)
+            k_depth = kh * kw * ic
+            group_bytes = ROW_LANES * k_depth * es
+        else:
+            expect = oc * kh * kw * es
+            if len(raw) != expect:
+                raise RuntimeError(f"L{i} dw weight bytes {len(raw)} != {expect}")
+            weights = dw_weights_from_blob(
+                raw, WGT_LAYOUT_OC_MAJOR, oc, kh, kw, dtype)
+            blob = dw_weights_to_blob(weights, WGT_LAYOUT_K_MAJOR)
+            group_bytes = ROW_LANES * kh * kw * es
+            if len(blob) > WGT_SRAM_BYTES:
+                raise RuntimeError(
+                    f"L{i} depthwise blob {len(blob)}B does not fit the weight SRAM")
+        if len(blob) != expect:
+            raise RuntimeError(f"L{i} transposed to {len(blob)} != {expect}")
+        if len(blob) <= WGT_SRAM_BYTES:
+            packed = blob
+            wpo = 0
+        else:
+            groups = (oc + ROW_LANES - 1) // ROW_LANES
+            padded = groups * group_bytes
+            packed = blob + bytes(padded - len(blob))
+            wpo = group_bytes // 4
+        d['wgt'] = _bytes_to_words(packed)
+        m['wgt_layout'] = 1
+        m['wgt_per_oc_words'] = wpo
+        if wpo or group_bytes > WGT_SRAM_BYTES:
+            print(f"  L{i} op={op} K-major wpo={wpo} words={len(d['wgt'])} "
+                  f"group={group_bytes}B")
 
 
 def build_chained_blob(meta, data, standalone_layer=-1):
@@ -172,10 +259,8 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         in_zp = m.get('in_zp', 0)
         input_src = m.get('input_src', -1)
         residual_src = m.get('residual_src', -1)
-        # Checked-in SoC goldens (model_a/model_e) omit wgt_layout and store
-        # conv weights OC-major. A missing key stays on the mesh. K-major
-        # blobs must set the key; the e2e harness default of 1 is for a
-        # different suite and mis-reads these bytes.
+        # prepare_row_weights sets this for conv and depthwise. A missing
+        # key stays 0 (pool, add, concat, and the streaming depthwise engine).
         wgt_layout = m.get('wgt_layout', 0)
 
         # cfg_aux: operator-specific config
@@ -377,6 +462,7 @@ def main():
     print(f"Loading golden data for {args.model}...")
     meta, data = load_model_golden(args.model)
     print(f"  {len(meta)} layers loaded")
+    prepare_row_weights(meta, data)
 
     # Check which layers have valid golden data
     valid = sum(1 for d in data if len(d['output']) > 0)

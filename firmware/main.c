@@ -331,8 +331,14 @@ static void npu_program_layer(const uint32_t *e,
     NPU_REG(REG_TILE_CFG)   = e[19];  /* tile_h | (tile_w<<16) */
     NPU_REG(REG_TILE_COUNT) = e[20];  /* tile_num_h | (tile_num_w<<16) */
 
-    /* SRAM base: out_base = tile_in_size/4 if tiled, else dma_in_size/4 */
-    uint32_t out_base = (e[23] > 0) ? (e[23] / 4) : (e[15] / 4);
+    /* OFM is a separate bank, so conv/depthwise/pool write at word 0.
+     * The old offset (input tile size) placed the output after the
+     * input in a shared SRAM. On a wide layer that offset plus the
+     * output tile no longer fits in the OFM half (model_a L60).
+     * Add keeps the offset: branch B is loaded after branch A in the IFM. */
+    uint32_t out_base = 0;
+    if (op_type == 4 || op_type == 7)
+        out_base = (e[23] > 0) ? (e[23] / 4) : (e[15] / 4);
     NPU_REG(REG_SRAM_BASE) = (out_base << 16) | act_base;
 
     /* DMA addresses — runtime-resolved input, metadata for wgt/param/out */
