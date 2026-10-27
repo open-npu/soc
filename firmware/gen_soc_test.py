@@ -111,12 +111,21 @@ def _bytes_to_words(blob):
     return np.frombuffer(blob, dtype=np.uint32).copy()
 
 
+def _row_group_channels(k_depth, elem_bytes):
+    """Widest power-of-two OC group whose full K vector fits WGT SRAM."""
+    for channels in (64, 32, 16, 8, 4, 2, 1):
+        if channels * k_depth * elem_bytes <= WGT_SRAM_BYTES:
+            return channels
+    return 0
+
+
 def prepare_row_weights(meta, data):
-    """Rewrite OC-major conv and depthwise blobs into the 64-lane layout.
+    """Rewrite OC-major conv, FC, and depthwise blobs into the 64-lane layout.
 
     Checked-in goldens omit wgt_layout. The row reads K-major, one 64-channel
     group at a time when the whole layer does not fit the weight SRAM.
-    Global-pool depthwise stays on the streaming engine and keeps its bytes.
+    FC is a 1x1 conv on that row. Global-pool depthwise stays on the
+    streaming engine and keeps its bytes.
     """
     sys.path.insert(0, os.path.join(PROJECT_ROOT, 'tools'))
     from model_packer import (
@@ -126,7 +135,7 @@ def prepare_row_weights(meta, data):
     )
     for i, (m, d) in enumerate(zip(meta, data)):
         op = m['op_type']
-        if op not in (0, 1) or len(d['wgt']) == 0:
+        if op not in (0, 1, 2) or len(d['wgt']) == 0:
             continue
         if op == 1 and _dw_stream(m):
             m['wgt_layout'] = 0
@@ -137,15 +146,28 @@ def prepare_row_weights(meta, data):
         kh, kw = m['kernel_h'], m['kernel_w']
         ic, oc = m['in_c'], m['out_c']
         raw = _words_to_bytes(d['wgt'])
-        if op == 0:
+        if op != 1:
             expect = oc * kh * kw * ic * es
             if len(raw) != expect:
                 raise RuntimeError(f"L{i} weight bytes {len(raw)} != {expect}")
+            k_depth = kh * kw * ic
+            auto_group_ch = _row_group_channels(k_depth, es)
+            if auto_group_ch == 0:
+                raise RuntimeError(
+                    f"L{i} one output channel ({k_depth * es}B) does not fit "
+                    f"the {WGT_SRAM_BYTES}B weight SRAM")
+            # A one-pixel tile cannot fill spare row lanes with more pixels.
+            # Keep 64 output channels and stream its K-major weights in SRAM-
+            # sized K slices instead. Bit 31 marks this interpretation of wpo.
+            kslice = (len(raw) > WGT_SRAM_BYTES
+                      and m.get('tile_h', 0) * m.get('tile_w', 0) <= 1
+                      and auto_group_ch < ROW_LANES)
+            group_ch = ROW_LANES if kslice else auto_group_ch
             weights = conv_weights_from_blob(
                 raw, WGT_LAYOUT_OC_MAJOR, oc, kh, kw, ic, dtype)
-            blob = conv_weights_to_blob(weights, WGT_LAYOUT_K_MAJOR, lanes=ROW_LANES)
-            k_depth = kh * kw * ic
-            group_bytes = ROW_LANES * k_depth * es
+            blob = conv_weights_to_blob(
+                weights, WGT_LAYOUT_K_MAJOR, lanes=group_ch)
+            group_bytes = group_ch * k_depth * es
         else:
             expect = oc * kh * kw * es
             if len(raw) != expect:
@@ -153,6 +175,7 @@ def prepare_row_weights(meta, data):
             weights = dw_weights_from_blob(
                 raw, WGT_LAYOUT_OC_MAJOR, oc, kh, kw, dtype)
             blob = dw_weights_to_blob(weights, WGT_LAYOUT_K_MAJOR)
+            group_ch = ROW_LANES
             group_bytes = ROW_LANES * kh * kw * es
             if len(blob) > WGT_SRAM_BYTES:
                 raise RuntimeError(
@@ -163,16 +186,19 @@ def prepare_row_weights(meta, data):
             packed = blob
             wpo = 0
         else:
-            groups = (oc + ROW_LANES - 1) // ROW_LANES
+            groups = (oc + group_ch - 1) // group_ch
             padded = groups * group_bytes
             packed = blob + bytes(padded - len(blob))
             wpo = group_bytes // 4
+            if op != 1 and kslice:
+                wpo |= 0x80000000
         d['wgt'] = _bytes_to_words(packed)
         m['wgt_layout'] = 1
         m['wgt_per_oc_words'] = wpo
         if wpo or group_bytes > WGT_SRAM_BYTES:
             print(f"  L{i} op={op} K-major wpo={wpo} words={len(d['wgt'])} "
-                  f"group={group_bytes}B")
+                  f"group_ch={group_ch} group={group_bytes}B"
+                  f"{' K-sliced' if op != 1 and kslice else ''}")
 
 
 def build_chained_blob(meta, data, standalone_layer=-1):
