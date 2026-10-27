@@ -747,7 +747,9 @@ void main(void) {
 #define STANDALONE_LAYER_VAL 24
 #endif
     /* Standalone FC test: run L24 only, using workspace mode (no tiling, no DDR chaining) */
-    uart_puts("\n[FC TEST] Running L24 standalone (workspace mode)\n");
+    uart_puts("\n[FC TEST] Running standalone layer ");
+    uart_put_dec(STANDALONE_LAYER_VAL);
+    uart_puts("\n");
     {
         /* Access blob at BLOB_MODEL_BASE */
         volatile const uint32_t *blob_fc = (volatile const uint32_t *)(uintptr_t)BLOB_MODEL_BASE;
@@ -760,7 +762,7 @@ void main(void) {
         const uint32_t *e24 = cursor_fc;
 
         /* Debug: print L24 header fields */
-        uart_puts("  L24 hdr: op=");
+        uart_puts("  hdr: op=");
         uart_put_dec(e24[4]);
         uart_puts(" n_wgt=");
         uart_put_dec(e24[0]);
