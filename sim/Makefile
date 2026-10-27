@@ -33,7 +33,7 @@ VERILATOR_FLAGS = --cc --exe -O3 \
 
 # Debug defines (enabled when DEBUG=1)
 ifeq ($(DEBUG),1)
-VERILATOR_FLAGS += +define+DBG_DOTBUF
+VERILATOR_FLAGS += +define+DBG_ROW
 endif
 
 # VCD tracing (enabled when VCD=1)
