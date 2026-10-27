@@ -358,9 +358,9 @@ static void npu_program_layer(const uint32_t *e,
     /* Per-OC weight reload */
     NPU_REG(REG_DMA_WGT_PER_OC) = e[26];
 
-    /* Weight blob layout: selects the 64-lane row (K-major) vs the systolic
-     * array (OC-major). Must be written every layer; a stale 1 would point
-     * the row at an OC-major blob. */
+    /* Weight blob layout: the 64-lane row uses K-major dense weights.
+     * Must be written every layer so a stale compatibility value cannot
+     * select an unsupported legacy layout. */
     NPU_REG(REG_WGT_LAYOUT) = e[36];
 
     /* Tiled DB_EN prefetch + PTS 2D DMA */
@@ -730,7 +730,7 @@ void main(void) {
 
     npu_hw_probe();
     uint32_t hwcfg = NPU_REG(REG_HW_CONFIG);
-    uart_puts("      Array size: ");
+    uart_puts("      Dense MAC lanes: ");
     uart_put_dec(HW_CFG_ARRAY_SIZE(hwcfg));
     uart_puts(", SPAD ");
     uart_put_dec(g_spad_kb);
