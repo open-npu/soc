@@ -860,7 +860,7 @@ void main(void) {
 #elif defined(RUN_model_x)
     test_case_t tc = { BLOB_MODEL_BASE, "model_x (benchmark INT16, 24 layers)" };
 #elif defined(RUN_MODEL_E)
-    test_case_t tc = { BLOB_MODEL_BASE, "model_e (synth_dw INT16, 31 layers)" };
+    test_case_t tc = { BLOB_MODEL_BASE, "model_e (synth_res rgb_data INT16, 31 layers)" };
 #else
     uart_puts("ERROR: No model selected. Compile with -DRUN_MODEL_X\n");
     while (1) {}
