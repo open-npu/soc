@@ -141,6 +141,11 @@ def prepare_row_weights(meta, data):
             m['wgt_layout'] = 0
             print(f"  L{i} depthwise stream stays OC-major")
             continue
+        if m.get('wgt_layout', 0) == WGT_LAYOUT_K_MAJOR:
+            # Current converters already emit grouped K-major weights and
+            # bin2golden supplies the matching reload stride. Repacking them
+            # as if they were legacy OC-major silently corrupts the blob.
+            continue
         es = 2 if m.get('data_type', 0) == 1 else 1
         dtype = np.int16 if es == 2 else np.int8
         kh, kw = m['kernel_h'], m['kernel_w']
