@@ -66,6 +66,7 @@ class NPUCore(Module):
             o_wb_mst_adr_o = npu_mst_adr_byte,
             o_wb_mst_dat_o = wb_mst.dat_w,
             o_wb_mst_sel_o = wb_mst.sel,
+            o_wb_mst_cti_o = wb_mst.cti,
             i_wb_mst_ack_i = wb_mst.ack,
             i_wb_mst_dat_i = wb_mst.dat_r,
 
