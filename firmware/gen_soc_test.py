@@ -82,7 +82,7 @@ def load_model_golden(model_name):
 
 
 def enable_conv_pool_strip_fusion(meta, data):
-    """Mark Model-B L0→L1 for firmware strip-major SRAM fusion."""
+    """Mark L0→L1 for firmware strip-major SRAM fusion."""
     if len(meta) < 2 or 'fuse_input' not in data[0]:
         return False
     conv, pool = meta[0], meta[1]
@@ -91,13 +91,40 @@ def enable_conv_pool_strip_fusion(meta, data):
             or conv.get('out_c') != pool.get('in_c')):
         raise RuntimeError("layer_00_fuse_input exists but L0→L1 is not Conv→Pool")
 
-    pool_strip_h = 6
-    producer_h = 2 * pool_strip_h + 1
+    pool_cfg = pool.get('pool_cfg', 0)
+    pool_h = (pool_cfg >> 4) & 0xF
+    pool_sh = (pool_cfg >> 12) & 0xF
+    elem_bytes = 2 if conv.get('data_type', 0) else 1
+    pool_strip_h = 0
+    for candidate in range(1, pool['out_h'] + 1):
+        candidate_producer_h = (candidate - 1) * pool_sh + pool_h
+        producer_bytes = (candidate_producer_h * conv['out_w']
+                          * conv['out_c'] * elem_bytes)
+        pool_out_bytes = (candidate * pool['out_w']
+                          * pool['out_c'] * elem_bytes)
+        conv_in_h = ((candidate_producer_h - 1) * conv['stride_h']
+                     + conv['kernel_h'])
+        conv_in_w = ((conv['out_w'] - 1) * conv['stride_w']
+                     + conv['kernel_w'])
+        conv_in_bytes = conv_in_h * conv_in_w * conv['in_c'] * elem_bytes
+        if (producer_bytes > 48 * 1024 or pool_out_bytes > 24 * 1024
+                or conv_in_bytes > 24 * 1024):
+            break
+        pool_strip_h = candidate
+    if pool_strip_h == 0:
+        raise RuntimeError("L0→L1 has no legal Conv→Pool fusion strip")
+
+    producer_h = (pool_strip_h - 1) * pool_sh + pool_h
     producer_w = conv['out_w']
     strip_count = (pool['out_h'] + pool_strip_h - 1) // pool_strip_h
     slot_bytes = len(data[0]['fuse_input']) * 4 // strip_count
-    if slot_bytes != ((31 * 117 + 3) & ~3):
-        raise RuntimeError(f"unexpected L0 fuse slot size {slot_bytes}")
+    local_in_h = ((producer_h - 1) * conv['stride_h'] + conv['kernel_h'])
+    local_in_w = ((producer_w - 1) * conv['stride_w'] + conv['kernel_w'])
+    expected_slot = ((local_in_h * local_in_w * conv['in_c']
+                      * elem_bytes + 3) // 4) * 4
+    if slot_bytes != expected_slot:
+        raise RuntimeError(f"unexpected L0 fuse slot size {slot_bytes}, "
+                           f"expected {expected_slot}")
 
     data[0]['input'] = data[0]['fuse_input']
     conv['sched_ctrl'] = conv.get('sched_ctrl', 0) | (1 << 5)
@@ -700,7 +727,7 @@ def main():
         retile_for_double_buffer(meta, args.model)
     if args.model.startswith('model_d_'):
         enable_untiled_sram_fusion(meta, args.model)
-    if args.model == 'model_b_int8' and args.standalone_layer < 0:
+    if args.model in ('model_b_int8', 'model_c_int8') and args.standalone_layer < 0:
         enable_conv_pool_strip_fusion(meta, data)
 
     # Check which layers have valid golden data
