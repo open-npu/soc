@@ -48,7 +48,7 @@ LAYER_ENTRY_HDR_SIZE = LAYER_ENTRY_HDR_WORDS * 4  # 148 bytes
 # The row keeps one 64-channel group in the 80KB weight SRAM.
 WGT_SRAM_BYTES = 80 * 1024
 ROW_LANES = 64
-IFM_DEPTH_WORDS = 24 * 256
+IFM_DEPTH_WORDS = 32 * 256
 
 
 def pack_u32(v):
