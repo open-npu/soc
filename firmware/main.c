@@ -118,9 +118,9 @@
 #define SCHED_NO_AUTO_DB    (1U << 6) /* Firmware-only: keep single-buffer PTS. */
 
 /* HW_CONFIG (0x018) [23:16] is the total on-chip SRAM in KB
- * (IFM 24 + OFM 48 + weight 80 + param 12 = 164). Fusion swaps the
+ * (IFM 32 + OFM 48 + weight 80 + param 12 = 172). Fusion swaps the
  * two activation banks, so the live cap is the smaller one: IFM,
- * 24KB = 6144 words. DB_EN halves that in sram_fuse_reuse.
+ * 32KB = 8192 words. DB_EN halves that in sram_fuse_reuse.
  * Compile with -DNPU_IFM_KB_OVERRIDE=N to pin the IFM size. */
 #ifndef NPU_SPAD_KB_OVERRIDE
 #define NPU_SPAD_KB_OVERRIDE 0
@@ -130,8 +130,8 @@
 #endif
 #define HW_CFG_ARRAY_SIZE(v) ((v) & 0xFFu)
 #define HW_CFG_SPAD_KB(v)    (((v) >> 16) & 0xFFu)
-#define NPU_SPAD_KB_DEFAULT  164u
-#define NPU_IFM_KB           24u
+#define NPU_SPAD_KB_DEFAULT  172u
+#define NPU_IFM_KB           32u
 
 static uint32_t g_spad_kb;
 static uint32_t g_act_words;
