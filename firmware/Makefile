@@ -31,9 +31,17 @@ SIM_DIR = ../sim
 
 all: $(TARGET).bin $(TARGET).hex $(MAIN_RAM_INIT)
 
-# Model selection. MODEL=model_b_int16 also injects -DRUN_MODEL_B for main.c.
-MODEL ?= model_b_int16
+# Model selection. MODEL=model_b_int8 also injects -DRUN_MODEL_B for main.c.
+MODEL ?= model_b_int8
 STANDALONE_LAYER ?= -1
+PERF_ONLY ?= 0
+PERF_HIST ?= 0
+ifeq ($(PERF_ONLY),1)
+DEFINES += -DPERF_ONLY
+endif
+ifeq ($(PERF_HIST),1)
+DEFINES += -DPERF_HIST
+endif
 ifeq ($(findstring model_a,$(MODEL)),model_a)
 DEFINES += -DRUN_MODEL_A
 endif

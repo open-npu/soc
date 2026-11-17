@@ -104,7 +104,9 @@ int main(int argc, char** argv) {
                     linebuf[linepos] = 0;
                     if ((linepos > 4 && linebuf[0] == ' ' && linebuf[1] == ' '
                          && linebuf[2] == 'L' && strchr(linebuf, ':'))
-                        || strstr(linebuf, "RESULT")) {
+                        || strstr(linebuf, "RESULT")
+                        || strstr(linebuf, "STL")
+                        || strstr(linebuf, "PERF_")) {
                         printf("[PERF] cyc=%lu | %s\n", sim_time / 2, linebuf);
                     }
                     if (strstr(linebuf, "RESULT: PASS"))
