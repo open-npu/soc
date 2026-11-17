@@ -74,8 +74,188 @@ def load_model_golden(model_name):
         input_b_path = os.path.join(d, f'{prefix}_input_b.npy')
         if os.path.exists(input_b_path):
             entry['input_b'] = np.load(input_b_path)
+        fuse_input_path = os.path.join(d, f'{prefix}_fuse_input.npy')
+        if os.path.exists(fuse_input_path):
+            entry['fuse_input'] = np.load(fuse_input_path)
         data.append(entry)
     return meta, data
+
+
+def enable_conv_pool_strip_fusion(meta, data):
+    """Mark model_x L0→L1 for firmware strip-major SRAM fusion."""
+    if len(meta) < 2 or 'fuse_input' not in data[0]:
+        return False
+    conv, pool = meta[0], meta[1]
+    if (conv.get('op_type') != 0 or pool.get('op_type') != 3
+            or conv.get('out_w') != pool.get('in_w')
+            or conv.get('out_c') != pool.get('in_c')):
+        raise RuntimeError("layer_00_fuse_input exists but L0→L1 is not Conv→Pool")
+
+    pool_strip_h = 6
+    producer_h = 2 * pool_strip_h + 1
+    producer_w = conv['out_w']
+    strip_count = (pool['out_h'] + pool_strip_h - 1) // pool_strip_h
+    slot_bytes = len(data[0]['fuse_input']) * 4 // strip_count
+    if slot_bytes != ((31 * 117 + 3) & ~3):
+        raise RuntimeError(f"unexpected L0 fuse slot size {slot_bytes}")
+
+    data[0]['input'] = data[0]['fuse_input']
+    conv['sched_ctrl'] = conv.get('sched_ctrl', 0) | (1 << 5)
+    # In strip mode these descriptor fields are consumed by firmware, not RTL.
+    conv['tile_h'] = producer_h
+    conv['tile_w'] = producer_w
+    conv['tile_num_h'] = strip_count
+    conv['tile_num_w'] = pool_strip_h
+    conv['tile_in_size'] = slot_bytes
+    print(f"  L0→L1 strip fusion: {strip_count} strips, "
+          f"producer={producer_h}x{producer_w}, pool_h={pool_strip_h}, "
+          f"input_slot={slot_bytes}B")
+    return True
+
+
+def retile_oversize_untiled_adds(meta):
+    """Split untiled Add tensors whose two inputs cannot coexist in IFM."""
+    changed = []
+    half_words = IFM_DEPTH_WORDS // 2
+    for i, m in enumerate(meta):
+        if m.get('op_type') != 4 or m.get('tile_h', 0) != 0:
+            continue
+        eb = 2 if m.get('data_type', 0) else 1
+        full_words = (m['in_h'] * m['in_w'] * m['in_c'] * eb + 3) // 4
+        if 2 * full_words <= IFM_DEPTH_WORDS:
+            continue
+        row_words = (m['in_w'] * m['in_c'] * eb + 3) // 4
+        tile_h = min(m['out_h'], half_words // (2 * row_words))
+        if tile_h == 0:
+            raise RuntimeError(f"L{i} Add one row cannot fit DB IFM half")
+        m['tile_h'] = tile_h
+        m['tile_w'] = m['out_w']
+        m['tile_num_h'] = (m['out_h'] + tile_h - 1) // tile_h
+        m['tile_num_w'] = 1
+        m['tile_in_size'] = tile_h * row_words * 4
+        m['tile_out_size'] = tile_h * row_words * 4
+        m['row_cfg'] = (tile_h << 16) | row_words
+        m['store_mode'] = 1
+        m['sched_ctrl'] = (m.get('sched_ctrl', 0) | (1 << 4)) & ~(1 << 5)
+        changed.append((i, tile_h, m['out_w']))
+    if changed:
+        print(f"  Re-tiled oversized Add layers: {changed}")
+    return changed
+
+
+def retile_for_double_buffer(meta, model_name):
+    """Shrink oversized tiles so both IFM ping/pong halves are usable."""
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, 'tools'))
+    from tiling import compute_tiling
+    from hw_config import DEFAULT_HW
+
+    op_names = {0: 'conv', 1: 'dw', 2: 'fc', 3: 'pool',
+                4: 'add', 5: 'resize', 6: 'deconv', 7: 'concat'}
+    half_bytes = (IFM_DEPTH_WORDS // 2) * 4
+    changed = []
+    for i, m in enumerate(meta):
+        if i == 0 or m.get('tile_h', 0) == 0:
+            continue
+        if m.get('op_type') not in (0, 1):
+            continue
+        if m.get('tile_in_size', 0) <= half_bytes:
+            continue
+        eb = 2 if m.get('data_type', 0) else 1
+        tile = compute_tiling(
+            op_type=op_names[m['op_type']],
+            in_h=m['in_h'], in_w=m['in_w'], in_c=m['in_c'],
+            out_h=m['out_h'], out_w=m['out_w'], out_c=m['out_c'],
+            kernel_h=m['kernel_h'], kernel_w=m['kernel_w'],
+            stride_h=m['stride_h'], stride_w=m['stride_w'],
+            elem_size=eb, double_buffer=True, profile=DEFAULT_HW)
+        th, tw = tile['tile_h'], tile['tile_w']
+        in_th = (th - 1) * m['stride_h'] + m['kernel_h']
+        in_tw = (tw - 1) * m['stride_w'] + m['kernel_w']
+        in_words = (in_th * in_tw * m['in_c'] * eb + 3) // 4
+        out_words = (th * tw * m['out_c'] * eb + 3) // 4
+        if in_words * 4 > half_bytes:
+            raise RuntimeError(f"L{i} DB tile input still exceeds IFM half")
+        old = (m['tile_h'], m['tile_w'])
+        m['tile_h'], m['tile_w'] = th, tw
+        m['tile_num_h'] = tile['tile_num_h']
+        m['tile_num_w'] = tile['tile_num_w']
+        m['tile_in_size'] = in_words * 4
+        m['tile_out_size'] = out_words * 4
+        m['row_cfg'] = (th << 16) | ((tw * m['out_c'] * eb + 3) // 4)
+        m['store_mode'] = 1
+        m['sched_ctrl'] = (m.get('sched_ctrl', 0) | (1 << 4)) & ~(1 << 6)
+        changed.append((i, old, (th, tw)))
+    if changed:
+        print(f"  {model_name} DB re-tiles: {changed}")
+    return changed
+
+
+def enable_untiled_sram_fusion(meta, model_name):
+    """Fuse safe untiled producer/consumer pairs through activation SRAM."""
+    referenced = set()
+    for m in meta:
+        for key in ('input_src', 'residual_src'):
+            if m.get(key, -1) >= 0:
+                referenced.add(m[key])
+
+    changed = []
+    i = 0
+    while i + 1 < len(meta):
+        prod, cons = meta[i], meta[i + 1]
+        if i + 2 < len(meta):
+            end = meta[i + 2]
+            end_words = ((end['out_h'] * end['out_w'] * end['out_c']
+                          * (2 if end.get('data_type', 0) else 1)) + 3) // 4
+            triple = (
+                prod.get('op_type') == 0
+                and cons.get('op_type') == 1
+                and end.get('op_type') == 0
+                and prod.get('kernel_h') == 1 and prod.get('kernel_w') == 1
+                and end.get('kernel_h') == 1 and end.get('kernel_w') == 1
+                and prod.get('tile_h', 0) == 0
+                and cons.get('tile_h', 0) == 0
+                and end.get('tile_h', 0) == 0
+                and i not in referenced and (i + 1) not in referenced
+                and prod['out_h'] == cons['in_h']
+                and prod['out_w'] == cons['in_w']
+                and prod['out_c'] == cons['in_c']
+                and cons['out_h'] == end['in_h']
+                and cons['out_w'] == end['in_w']
+                and cons['out_c'] == end['in_c']
+                and end_words <= IFM_DEPTH_WORDS
+            )
+            if triple:
+                prod['sched_ctrl'] = (prod.get('sched_ctrl', 0) & ~0x0E) | (1 << 1)
+                cons['sched_ctrl'] = (cons.get('sched_ctrl', 0) & ~0x0E) | (1 << 2)
+                end['sched_ctrl'] = (end.get('sched_ctrl', 0) & ~0x0E) | (1 << 3)
+                changed.append((i, i + 1, i + 2))
+                i += 3
+                continue
+        eb = 2 if prod.get('data_type', 0) else 1
+        prod_words = (prod['out_h'] * prod['out_w'] * prod['out_c'] * eb + 3) // 4
+        cons_words = (cons['out_h'] * cons['out_w'] * cons['out_c'] * eb + 3) // 4
+        safe = (
+            prod.get('op_type') in (0, 1, 3)
+            and cons.get('op_type') in (0, 1, 2, 3)
+            and prod.get('tile_h', 0) == 0
+            and cons.get('tile_h', 0) == 0
+            and i not in referenced
+            and prod['out_h'] == cons['in_h']
+            and prod['out_w'] == cons['in_w']
+            and prod['out_c'] == cons['in_c']
+            and prod_words <= IFM_DEPTH_WORDS
+            and cons_words <= IFM_DEPTH_WORDS
+        )
+        if safe:
+            prod['sched_ctrl'] = (prod.get('sched_ctrl', 0) & ~0x0E) | (1 << 1)
+            cons['sched_ctrl'] = (cons.get('sched_ctrl', 0) & ~0x0E) | (1 << 3)
+            changed.append((i, i + 1))
+            i += 2
+        else:
+            i += 1
+    if changed:
+        print(f"  {model_name} SRAM-fused pairs: {changed}")
+    return changed
 
 
 def remap_ddr(addr):
@@ -138,8 +318,29 @@ def prepare_row_weights(meta, data):
         if op not in (0, 1, 2) or len(d['wgt']) == 0:
             continue
         if op == 1 and _dw_stream(m):
-            m['wgt_layout'] = 0
-            print(f"  L{i} depthwise stream stays OC-major")
+            # The streaming engine reloads contiguous 16-channel blocks where
+            # every channel owns KH*KW adjacent elements ([C][KH][KW]).  Fresh
+            # converter output can already be K-major ([KH][KW][C]); changing
+            # only the descriptor bit would then make every reload interpret
+            # the right bytes in the wrong order.
+            if m.get('wgt_layout', 0) == WGT_LAYOUT_K_MAJOR:
+                es = 2 if m.get('data_type', 0) == 1 else 1
+                dtype = np.int16 if es == 2 else np.int8
+                kh, kw, oc = m['kernel_h'], m['kernel_w'], m['out_c']
+                raw = _words_to_bytes(d['wgt'])
+                expect = oc * kh * kw * es
+                if len(raw) != expect:
+                    raise RuntimeError(
+                        f"L{i} DW-stream weight bytes {len(raw)} != {expect}")
+                weights = dw_weights_from_blob(
+                    raw, WGT_LAYOUT_K_MAJOR, oc, kh, kw, dtype)
+                d['wgt'] = _bytes_to_words(
+                    dw_weights_to_blob(weights, WGT_LAYOUT_OC_MAJOR))
+                print(f"  L{i} depthwise stream K-major -> OC-major")
+            else:
+                print(f"  L{i} depthwise stream stays OC-major")
+            m['wgt_layout'] = WGT_LAYOUT_OC_MAJOR
+            m['wgt_per_oc_words'] = 0
             continue
         if m.get('wgt_layout', 0) == WGT_LAYOUT_K_MAJOR:
             # Current converters already emit grouped K-major weights and
@@ -494,6 +695,13 @@ def main():
     meta, data = load_model_golden(args.model)
     print(f"  {len(meta)} layers loaded")
     prepare_row_weights(meta, data)
+    retile_oversize_untiled_adds(meta)
+    if args.model.startswith(('model_x_', 'model_x_')):
+        retile_for_double_buffer(meta, args.model)
+    if args.model.startswith('model_x_'):
+        enable_untiled_sram_fusion(meta, args.model)
+    if args.model == 'model_x' and args.standalone_layer < 0:
+        enable_conv_pool_strip_fusion(meta, data)
 
     # Check which layers have valid golden data
     valid = sum(1 for d in data if len(d['output']) > 0)

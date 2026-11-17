@@ -34,6 +34,14 @@ all: $(TARGET).bin $(TARGET).hex $(MAIN_RAM_INIT)
 # Model selection. MODEL=model_x also injects -DRUN_model_x for main.c.
 MODEL ?= model_x
 STANDALONE_LAYER ?= -1
+PERF_ONLY ?= 0
+PERF_HIST ?= 0
+ifeq ($(PERF_ONLY),1)
+DEFINES += -DPERF_ONLY
+endif
+ifeq ($(PERF_HIST),1)
+DEFINES += -DPERF_HIST
+endif
 ifeq ($(findstring model_x,$(MODEL)),model_x)
 DEFINES += -DRUN_model_x
 endif
