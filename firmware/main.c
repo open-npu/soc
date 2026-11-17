@@ -511,10 +511,10 @@ static void copy_layer_entry(uint32_t *dst, const uint32_t *src) {
 
 /* Execute a large Conv→Pool pair as SRAM-resident full-width strips.
  *
- * L0 recomputes the one-row overlap required by 3x3/s2 Pool. FUSE_START
- * leaves each producer strip in physical OFM; FUSE_END swaps the activation
- * roles and consumes it without a DDR round trip. Only Pool output reaches
- * DDR, at its final global row offset.
+ * Adjacent producer strips overlap when the Pool window is wider than its
+ * stride. FUSE_START leaves each producer strip in physical OFM; FUSE_END
+ * swaps the activation roles and consumes it without a DDR round trip. Only
+ * Pool output reaches DDR, at its final global row offset.
  */
 static int run_conv_pool_strips(const uint32_t *conv_e,
                                 const uint32_t *pool_e) {
@@ -530,6 +530,9 @@ static int run_conv_pool_strips(const uint32_t *conv_e,
     uint32_t pool_out_w = pool_e[8] & 0xFFFFu;
     uint32_t pool_out_c = pool_e[9];
     uint32_t elem_bytes = (pool_e[5] & 1u) ? 2u : 1u;
+    uint32_t pool_cfg = pool_e[18];
+    uint32_t pool_kh = (pool_cfg >> 4) & 0xFu;
+    uint32_t pool_sh = (pool_cfg >> 12) & 0xFu;
     uint32_t conv_kh = conv_e[10] & 0xFFu;
     uint32_t conv_kw = (conv_e[10] >> 8) & 0xFFu;
     uint32_t conv_sh = conv_e[11] & 0xFFu;
@@ -538,13 +541,14 @@ static int run_conv_pool_strips(const uint32_t *conv_e,
     uint32_t local_in_w = (producer_w - 1u) * conv_sw + conv_kw;
 
     if (!producer_h || !producer_w || !strip_count || !pool_strip_h
+        || !pool_kh || !pool_sh
         || !input_slot || elem_bytes != 1u)
         return -1;
 
     for (uint32_t s = 0; s < strip_count; s++) {
         uint32_t pool_y = s * pool_strip_h;
         uint32_t valid_pool_h = pool_out_h - pool_y;
-        uint32_t producer_y = pool_y * 2u;
+        uint32_t producer_y = pool_y * pool_sh;
         uint32_t valid_pool_in_h = conv_out_h - producer_y;
         if (valid_pool_h > pool_strip_h)
             valid_pool_h = pool_strip_h;
