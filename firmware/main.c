@@ -1474,8 +1474,12 @@ void main(void) {
             dcache_flush();
             volatile uint32_t *out = (volatile uint32_t *)out_addr;
             int err = 0;
+            uint32_t first_err = e24[3];
+            uint32_t last_err = 0;
             for (uint32_t i = 0; i < e24[3]; i++) {
                 if (out[i] != golden24[i]) {
+                    if (first_err == e24[3]) first_err = i;
+                    last_err = i;
                     if (err < 5) {
                         uart_puts("  w[");
                         uart_put_dec(i);
@@ -1495,7 +1499,11 @@ void main(void) {
             } else {
                 uart_puts("  FC: FAIL — ");
                 uart_put_dec(err);
-                uart_puts(" mismatches\n");
+                uart_puts(" mismatches, range=[");
+                uart_put_dec(first_err);
+                uart_puts(", ");
+                uart_put_dec(last_err);
+                uart_puts("]\n");
                 global_err++;
             }
         }
