@@ -34,8 +34,12 @@ all: $(TARGET).bin $(TARGET).hex $(MAIN_RAM_INIT)
 # Model selection. MODEL=model_x also injects -DRUN_model_x for main.c.
 MODEL ?= model_x
 STANDALONE_LAYER ?= -1
+SUPER_BLOCK ?= 1
 PERF_ONLY ?= 0
 PERF_HIST ?= 0
+ifeq ($(SUPER_BLOCK),1)
+GEN_SUPER_BLOCK = --enable-super-block
+endif
 ifeq ($(PERF_ONLY),1)
 DEFINES += -DPERF_ONLY
 endif
@@ -62,7 +66,7 @@ endif
 # variables rather than files, so timestamp-only dependencies can otherwise
 # silently reuse a blob generated for a different model.
 $(TEST_DATA_BIN): FORCE gen_soc_test.py
-	python3 gen_soc_test.py --model $(MODEL) --standalone-layer $(STANDALONE_LAYER)
+	python3 gen_soc_test.py --model $(MODEL) --standalone-layer $(STANDALONE_LAYER) $(GEN_SUPER_BLOCK)
 
 $(TEST_DATA_H): $(TEST_DATA_BIN)
 	@test -f $@

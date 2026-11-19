@@ -214,7 +214,48 @@ def retile_for_double_buffer(meta, model_name):
         changed.append((i, old, (th, tw)))
     if changed:
         print(f"  {model_name} DB re-tiles: {changed}")
-    return changed
+
+
+def mark_model_x(meta, model_name):
+    """Mark all strict stride-1 inverted-residual blocks supported by RTL."""
+    if model_name != 'model_x':
+        return
+    for layer in meta:
+        layer['sched_ctrl'] = layer.get('sched_ctrl', 0) & ~(1 << 7)
+    tile_for_hw = {56: (28, 10), 28: (28, 6), 14: (14, 12)}
+    marked = []
+    for i in range(len(meta) - 2):
+        a, b, c = meta[i:i + 3]
+        h = a['in_h']
+        exact = (
+            (a['op_type'], b['op_type'], c['op_type']) == (0, 1, 0)
+            and h in tile_for_hw and a['in_w'] == h
+            and (a['in_c'], a['out_c']) in ((56, 112), (96, 192))
+            and (a['out_h'], a['out_w']) == (h, h)
+            and (b['in_h'], b['in_w'], b['out_h'], b['out_w']) == (h, h, h, h)
+            and (b['in_c'], b['out_c'], b['kernel_h'], b['kernel_w'],
+                 b['stride_h'], b['stride_w'], b['pad_top'], b['pad_left'])
+                == (a['out_c'], a['out_c'], 3, 3, 1, 1, 1, 1)
+            and (c['in_h'], c['in_w'], c['out_h'], c['out_w']) == (h, h, h, h)
+            and (c['in_c'], c['out_c'], c['kernel_h'], c['kernel_w'],
+                 c['stride_h'], c['stride_w'])
+                == (a['out_c'], a['in_c'], 1, 1, 1, 1)
+            and all(x['data_type'] == 0 for x in (a, b, c))
+        )
+        if exact:
+            th, tw = tile_for_hw[h]
+            for x in (a, b, c):
+                x['tile_h'], x['tile_w'] = th, tw
+                x['tile_num_h'] = (h + th - 1) // th
+                x['tile_num_w'] = (h + tw - 1) // tw
+                x['sched_ctrl'] &= ~0x1f
+                x['store_mode'] = 1
+            a['sched_ctrl'] |= 1 << 7
+            marked.append(i)
+    expected = [6, 10, 14, 18, 25, 29, 33, 37, 41, 45, 52, 56]
+    if marked != expected:
+        raise ValueError(f"model_x strict super blocks changed: {marked}")
+    print(f"  Marked strict super blocks: {marked}")
 
 
 def enable_untiled_sram_fusion(meta, model_name):
@@ -712,6 +753,8 @@ def main():
                       help='Validate the 37-word binary ABI and exit')
     parser.add_argument('--standalone-layer', type=int, default=-1,
                         help='Also pack input data for this layer (for standalone testing)')
+    parser.add_argument('--enable-super-block', action='store_true',
+                        help='Explicitly mark the strict Model A INT8 L52-L54 prototype')
     args = parser.parse_args()
 
     if args.self_test:
@@ -725,6 +768,8 @@ def main():
     retile_oversize_untiled_adds(meta)
     if args.model.startswith(('model_x_', 'model_x_')):
         retile_for_double_buffer(meta, args.model)
+    if args.enable_super_block:
+        mark_model_x(meta, args.model)
     if args.model.startswith('model_x_'):
         enable_untiled_sram_fusion(meta, args.model)
     if args.model in ('model_x', 'model_c_int8') and args.standalone_layer < 0:

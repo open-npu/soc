@@ -87,6 +87,9 @@
 #define REG_NEXT_PARAM_CFG  0x154
 #define REG_PARAM_BANK_CTRL 0x158
 #define REG_NEXT_PARAM_STATUS 0x15C
+#define REG_SUPER_CTRL      0x160
+#define REG_SUPER_STATUS    0x164
+#define REG_SUPER_DESC_BASE 0x400
 #define REG_POST_CTRL       0x180
 #define REG_POST_PARAM_CNT  0x188
 #define REG_POST_CLAMP      0x18C
@@ -116,6 +119,7 @@
 #define SCHED_FUSE_MASK     (SCHED_FUSE_START | SCHED_FUSE_MID | SCHED_FUSE_END)
 #define SCHED_FUSE_STRIP    (1U << 5) /* Firmware-only Conv→Pool strip schedule. */
 #define SCHED_NO_AUTO_DB    (1U << 6) /* Firmware-only: keep single-buffer PTS. */
+#define SCHED_SUPER_BLOCK   (1U << 7) /* Firmware-only validated super-block schedule. */
 
 /* HW_CONFIG (0x018) [23:16] is the total on-chip SRAM in KB
  * (IFM 32 + OFM 48 + weight 80 + param 12 = 172). Fusion swaps the
@@ -354,6 +358,9 @@ static int sram_fuse_reuse(const uint32_t *prev, const uint32_t *cur) {
 static void npu_reset(void) {
     NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
     for (volatile int i = 0; i < 100; i++) {}
+    /* Super-tile is opt-in.  The current RTL exposes frozen descriptor slots
+     * but rejects execution with E11 until the block FSM is implemented. */
+    NPU_REG(REG_SUPER_CTRL) = 0;
     NPU_REG(REG_IRQ_STATUS) = 0x7;
     NPU_REG(REG_IRQ_EN) = 0;
 }
@@ -398,6 +405,9 @@ static void npu_program_layer(const uint32_t *e,
                               uint32_t next_param_addr,
                               uint32_t next_param_words,
                               uint32_t next_param_bank) {
+    /* Preserve every legacy A-E path even after a debugger/earlier test wrote
+     * the experimental descriptor window. */
+    NPU_REG(REG_SUPER_CTRL) = 0;
     uint32_t op_type   = e[4];
     uint32_t data_type = e[5];
     uint32_t in_zp     = e[28];
@@ -509,6 +519,97 @@ static void copy_layer_entry(uint32_t *dst, const uint32_t *src) {
         dst[i] = src[i];
 }
 
+static void program_super_slot(uint32_t slot, const uint32_t *e,
+                               uint32_t runtime_in_addr,
+                               uint32_t runtime_out_addr,
+                               uint32_t wgt_base, uint32_t param_base,
+                               uint32_t tile_h, uint32_t tile_w,
+                               uint32_t tiles_h, uint32_t tiles_w) {
+    uint32_t d[44];
+    for (uint32_t i = 0; i < 44; i++)
+        d[i] = 0;
+    d[0] = (e[4] & 0xFu) | ((e[5] & 1u) << 4)
+         | ((e[28] & 0xFFFFu) << 8);
+    d[1] = e[6];  d[2] = e[7];  d[3] = e[8];  d[4] = e[9];
+    d[5] = e[10] & 0xFFFFu;
+    d[6] = e[11]; d[7] = e[12];
+    if ((e[4] & 0xFu) == 3u) d[8] = e[18];
+    d[12] = tile_h | (tile_w << 16);
+    d[13] = tiles_h | (tiles_w << 16);
+    d[14] = 0;
+    d[15] = runtime_in_addr;
+    d[16] = runtime_out_addr;
+    d[17] = e[29];
+    d[18] = e[30];
+    d[19] = slot == 0 ? (e[6] & 0xFFFFu) * e[7] : 0u;
+    d[21] = 0;       /* no DB_EN/fusion flags */
+    d[24] = e[15];   d[25] = e[16]; d[26] = e[17];
+    d[27] = e[23];   d[28] = e[24];
+    d[29] = 0;       /* controller owns final PTS store */
+    d[30] = e[25];   d[31] = 0;     d[32] = e[36];
+    d[36] = 0;       /* no parameter ping/pong */
+    d[37] = e[13];   d[38] = e[14]; d[39] = e[27];
+    d[42] = wgt_base;
+    d[43] = param_base;
+
+    NPU_REG(REG_SUPER_CTRL) = (slot & 3u) << 8;
+    for (uint32_t i = 0; i < 44; i++)
+        NPU_REG(REG_SUPER_DESC_BASE + i * 4u) = d[i];
+}
+
+static int run_model_x(const uint32_t *a, const uint32_t *dw,
+                             const uint32_t *pw, uint32_t runtime_in_addr) {
+    uint32_t h = a[6] >> 16;
+    uint32_t w = a[6] & 0xFFFFu;
+    uint32_t in_c = a[7], mid_c = a[9];
+    uint32_t tile_h, tile_w, tiles_h, tiles_w;
+    uint32_t wgt0, wgt1, wgt2, param0, param1, param2;
+    if ((a[4] & 0xFu) != 0u || (dw[4] & 0xFu) != 1u
+            || (pw[4] & 0xFu) != 0u
+            || a[5] != 0 || dw[5] != 0 || pw[5] != 0
+            || h != w
+            || !((in_c == 56u && mid_c == 112u)
+                 || (in_c == 96u && mid_c == 192u))
+            || dw[6] != a[8] || dw[8] != a[8]
+            || dw[7] != mid_c || dw[9] != mid_c || dw[10] != 0x303u
+            || dw[11] != 0x101u || dw[12] != 0x101u
+            || pw[6] != a[8] || pw[8] != a[8]
+            || pw[7] != mid_c || pw[9] != in_c)
+        return -13;
+    if (h == 56u) { tile_h = 28u; tile_w = 10u; }
+    else if (h == 28u) { tile_h = 28u; tile_w = 6u; }
+    else if (h == 14u) { tile_h = 14u; tile_w = 12u; }
+    else return -13;
+    tiles_h = (h + tile_h - 1u) / tile_h;
+    tiles_w = (w + tile_w - 1u) / tile_w;
+
+    /* Word-addressed, naturally aligned, non-overlapping resident regions. */
+    wgt0 = 0;
+    wgt1 = wgt0 + ((a[16] + 3u) >> 2);
+    wgt2 = wgt1 + ((dw[16] + 3u) >> 2);
+    param0 = 0;
+    param1 = param0 + a[14] * 4u;
+    param2 = param1 + dw[14] * 4u;
+
+    program_super_slot(0, a, runtime_in_addr, 0, wgt0, param0,
+                       tile_h, tile_w, tiles_h, tiles_w);
+    program_super_slot(1, dw, 0, 0, wgt1, param1,
+                       tile_h, tile_w, tiles_h, tiles_w);
+    program_super_slot(2, pw, 0, pw[31], wgt2, param2,
+                       tile_h, tile_w, tiles_h, tiles_w);
+
+    NPU_REG(REG_IRQ_STATUS) = 0x7;
+    NPU_REG(REG_SUPER_CTRL) = 1u; /* request, START slot 0 */
+    dcache_flush();
+    NPU_REG(REG_CTRL) = CTRL_START;
+    dcache_flush();
+    {
+        int ret = npu_wait_done();
+        NPU_REG(REG_SUPER_CTRL) = 0;
+        return ret;
+    }
+}
+
 /* Execute a large Conv→Pool pair as SRAM-resident full-width strips.
  *
  * Adjacent producer strips overlap when the Pool window is wider than its
@@ -615,7 +716,7 @@ typedef struct {
 
 #ifdef PERF_ONLY
 /* Per-layer histogram snapshot, printed after PERF_END so the UART traffic
- * does not extend the measured interval. 13 words per layer.
+ * does not extend the measured interval. 14 words per logical layer.
  *
  * Reading the counters still costs a few thousand cycles per model, so the
  * snapshot is behind PERF_HIST: a plain PERF_ONLY build measures the
@@ -623,6 +724,32 @@ typedef struct {
 #define PERF_LAYER_MAX 80
 static uint32_t perf_layer_log[PERF_LAYER_MAX * 14];
 static int      perf_layer_idx;
+#ifdef PERF_HIST
+static void perf_hist_push(int capture) {
+    if (perf_layer_idx >= PERF_LAYER_MAX)
+        return;
+    uint32_t *p = &perf_layer_log[perf_layer_idx * 14];
+    for (int i = 0; i < 14; i++)
+        p[i] = 0;
+    if (capture) {
+        p[0]  = NPU_REG(REG_ST_MAC);
+        p[1]  = NPU_REG(REG_ST_WAIT);
+        p[2]  = NPU_REG(REG_ST_WB);
+        p[3]  = NPU_REG(REG_ST_POOL);
+        p[4]  = NPU_REG(REG_ST_ADD);
+        p[5]  = NPU_REG(REG_ST_RSZ);
+        p[6]  = NPU_REG(REG_ST_CFG);
+        p[7]  = NPU_REG(REG_ST_OTH);
+        p[8]  = NPU_REG(REG_WT_ACT);
+        p[9]  = NPU_REG(REG_WT_WGT);
+        p[10] = NPU_REG(REG_WT_DB);
+        p[11] = NPU_REG(REG_MAC_IDLE);
+        p[12] = NPU_REG(REG_PERF_DMA);
+        p[13] = NPU_REG(REG_WT_STORE);
+    }
+    perf_layer_idx++;
+}
+#endif
 #endif
 
 static int run_chained_model(test_case_t *tc) {
@@ -694,6 +821,85 @@ static int run_chained_model(test_case_t *tc) {
         const uint32_t *e = cursor;
         const uint32_t *prev = (l > 0) ? layer_e[l - 1] : 0;
         const uint32_t *next = (l + 1 < num_layers) ? layer_e[l + 1] : 0;
+
+        if ((e[21] & SCHED_SUPER_BLOCK) && l + 2 < num_layers) {
+            const uint32_t *dw_cursor =
+                cursor + LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2] + e[3];
+            const uint32_t *pw_cursor =
+                dw_cursor + LAYER_ENTRY_HDR_WORDS
+                + dw_cursor[0] + dw_cursor[1] + dw_cursor[2] + dw_cursor[3];
+            uint32_t runtime_in_addr = (l == 0) ? e[32] : layer_out_addr[l - 1];
+            int ret = run_model_x(e, dw_cursor, pw_cursor,
+                                        runtime_in_addr);
+            if (ret != 0) {
+                uart_puts("  SUPER ERROR at L");
+                uart_put_dec(l);
+                uart_putc(' ');
+                uart_put_dec((uint32_t)(-ret));
+                uart_puts(" HW_E=");
+                uart_put_dec(NPU_REG(REG_ERROR_CODE));
+                uart_putc('\n');
+                return -1;
+            }
+            param_preloaded = 0;
+            param_bank = 0;
+#ifdef PERF_ONLY
+#ifdef PERF_HIST
+            /* One HW transaction represents three logical model layers.
+             * Keep two explicit placeholders and attribute the aggregate
+             * counters to the final PW layer so all later STL indices align. */
+            perf_hist_push(0);
+            perf_hist_push(0);
+            perf_hist_push(1);
+#endif
+#endif
+#ifndef PERF_ONLY
+            dcache_flush();
+            {
+                uint32_t n_output = pw_cursor[3];
+                const uint32_t *golden =
+                    pw_cursor + LAYER_ENTRY_HDR_WORDS
+                    + pw_cursor[0] + pw_cursor[1] + pw_cursor[2];
+                volatile const uint32_t *out_ptr =
+                    (volatile const uint32_t *)(uintptr_t)pw_cursor[31];
+                uint32_t mismatches = 0;
+                for (uint32_t i = 0; i < n_output; i++) {
+                    if (out_ptr[i] != golden[i]) {
+                        if (mismatches < 10) {
+                            uart_puts("  SUPER w[");
+                            uart_put_dec(i);
+                            uart_puts("]: exp=0x");
+                            uart_put_hex32(golden[i]);
+                            uart_puts(" got=0x");
+                            uart_put_hex32(out_ptr[i]);
+                            uart_putc('\n');
+                        }
+                        mismatches++;
+                    }
+                }
+                if (mismatches) {
+                    uart_puts("  SUPER FAIL at L");
+                    uart_put_dec(l);
+                    uart_puts(": ");
+                    uart_put_dec(mismatches);
+                    uart_puts(" mismatches\n");
+                    total_err += mismatches;
+                } else {
+                    uart_puts("  SUPER PASS L");
+                    uart_put_dec(l);
+                    uart_puts("-L");
+                    uart_put_dec(l + 2);
+                    uart_puts(" (");
+                    uart_put_dec(n_output);
+                    uart_puts(" words)\n");
+                }
+            }
+#endif
+            cursor = pw_cursor + LAYER_ENTRY_HDR_WORDS
+                   + pw_cursor[0] + pw_cursor[1] + pw_cursor[2] + pw_cursor[3];
+            l += 2;
+            continue;
+        }
 
         if ((e[21] & SCHED_FUSE_STRIP) && next) {
             const uint32_t *pool_cursor =
