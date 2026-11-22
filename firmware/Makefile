@@ -37,6 +37,17 @@ STANDALONE_LAYER ?= -1
 SUPER_BLOCK ?= 1
 PERF_ONLY ?= 0
 PERF_HIST ?= 0
+IFM_KB ?= 32
+OFM_KB ?= 48
+WGT_KB ?= 80
+PARAM_KB ?= 12
+export NPU_IFM_KB := $(IFM_KB)
+export NPU_OFM_KB := $(OFM_KB)
+export NPU_WGT_KB := $(WGT_KB)
+export NPU_PARAM_KB := $(PARAM_KB)
+DEFINES += -DNPU_IFM_KB_OVERRIDE=$(IFM_KB)
+DEFINES += -DNPU_OFM_KB_OVERRIDE=$(OFM_KB)
+DEFINES += -DNPU_SPAD_KB_OVERRIDE=$(shell expr $(IFM_KB) + $(OFM_KB) + $(WGT_KB) + $(PARAM_KB))
 ifeq ($(SUPER_BLOCK),1)
 GEN_SUPER_BLOCK = --enable-super-block
 endif
@@ -60,6 +71,10 @@ DEFINES += -DRUN_model_x
 endif
 ifeq ($(findstring model_e,$(MODEL)),model_e)
 DEFINES += -DRUN_MODEL_E
+endif
+MODEL_CODE := $(word 2,$(subst _, ,$(MODEL)))
+ifeq ($(filter a b c d e,$(MODEL_CODE)),)
+DEFINES += -DRUN_MODEL_GENERIC -DMODEL_LABEL=\"$(MODEL)\"
 endif
 
 # Generate both artifacts on every build. MODEL and STANDALONE_LAYER are make

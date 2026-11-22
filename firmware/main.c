@@ -132,13 +132,18 @@
 #ifndef NPU_IFM_KB_OVERRIDE
 #define NPU_IFM_KB_OVERRIDE 0
 #endif
+#ifndef NPU_OFM_KB_OVERRIDE
+#define NPU_OFM_KB_OVERRIDE 0
+#endif
 #define HW_CFG_ARRAY_SIZE(v) ((v) & 0xFFu)
 #define HW_CFG_SPAD_KB(v)    (((v) >> 16) & 0xFFu)
 #define NPU_SPAD_KB_DEFAULT  172u
 #define NPU_IFM_KB           32u
+#define NPU_OFM_KB           48u
 
 static uint32_t g_spad_kb;
 static uint32_t g_act_words;
+static uint32_t g_ofm_words;
 
 /* ═══════════════════════════════════════════════════════════════════
  *  UART helpers
@@ -234,6 +239,8 @@ static void npu_hw_probe(void) {
         spad = NPU_SPAD_KB_DEFAULT;
     g_spad_kb = spad;
     g_act_words = npu_act_words_from_spad_kb(spad);
+    g_ofm_words = (NPU_OFM_KB_OVERRIDE ? (uint32_t)NPU_OFM_KB_OVERRIDE
+                                       : (uint32_t)NPU_OFM_KB) * 256u;
 }
 
 static uint16_t layer_tile_h(const uint32_t *e) {
@@ -315,7 +322,7 @@ static int layer_db_ok(const uint32_t *e) {
              * e[9] * eb / 4u;
     if (tile_out == 0)
         tile_out = e[24] / 4u;
-    if (tile_out > g_act_words)
+    if (tile_out > g_ofm_words / 2u)
         return 0;
 
     return 1;
@@ -1520,6 +1527,8 @@ void main(void) {
     test_case_t tc = { BLOB_MODEL_BASE, "model_x (benchmark INT16, 24 layers)" };
 #elif defined(RUN_MODEL_E)
     test_case_t tc = { BLOB_MODEL_BASE, "model_e (synth_res rgb_data INT16, 31 layers)" };
+#elif defined(RUN_MODEL_GENERIC)
+    test_case_t tc = { BLOB_MODEL_BASE, MODEL_LABEL };
 #else
     uart_puts("ERROR: No model selected. Compile with -DRUN_MODEL_X\n");
     while (1) {}

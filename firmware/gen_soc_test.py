@@ -19,6 +19,7 @@ SPDX-License-Identifier: Apache-2.0
 
 import json
 import os
+import re
 import struct
 import sys
 import argparse
@@ -28,7 +29,9 @@ import numpy as np
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SOC_DIR = os.path.dirname(SCRIPT_DIR)
 PROJECT_ROOT = os.path.dirname(SOC_DIR)
-GOLDEN_DIR = os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden', 'golden_dma_e2e')
+GOLDEN_DIR = os.environ.get(
+    'NPU_GOLDEN_DIR',
+    os.path.join(PROJECT_ROOT, 'rtl', 'tb', 'golden', 'golden_dma_e2e'))
 
 OUTPUT_DIR = SCRIPT_DIR
 BLOB_FILE = os.path.join(OUTPUT_DIR, 'test_data.bin')
@@ -46,9 +49,13 @@ LAYER_ENTRY_HDR_WORDS = 37
 LAYER_ENTRY_HDR_SIZE = LAYER_ENTRY_HDR_WORDS * 4  # 148 bytes
 
 # The row keeps one 64-channel group in the 80KB weight SRAM.
-WGT_SRAM_BYTES = 80 * 1024
+IFM_KB = int(os.environ.get('NPU_IFM_KB', '32'))
+OFM_KB = int(os.environ.get('NPU_OFM_KB', '48'))
+WGT_KB = int(os.environ.get('NPU_WGT_KB', '80'))
+PARAM_KB = int(os.environ.get('NPU_PARAM_KB', '12'))
+WGT_SRAM_BYTES = WGT_KB * 1024
 ROW_LANES = 64
-IFM_DEPTH_WORDS = 32 * 256
+IFM_DEPTH_WORDS = IFM_KB * 256
 
 
 def pack_u32(v):
@@ -174,7 +181,13 @@ def retile_for_double_buffer(meta, model_name):
     """Shrink oversized tiles so both IFM ping/pong halves are usable."""
     sys.path.insert(0, os.path.join(PROJECT_ROOT, 'tools'))
     from tiling import compute_tiling
-    from hw_config import DEFAULT_HW
+    from hw_config import HWConfig
+    profile = HWConfig(
+        act_bank_size=IFM_KB * 1024,
+        ofm_bank_size=OFM_KB * 1024,
+        weight_buf_size=WGT_KB * 1024,
+        param_sram_size=PARAM_KB * 1024,
+        param_sram_max_ch=(PARAM_KB * 1024) // 16)
 
     op_names = {0: 'conv', 1: 'dw', 2: 'fc', 3: 'pool',
                 4: 'add', 5: 'resize', 6: 'deconv', 7: 'concat'}
@@ -183,18 +196,30 @@ def retile_for_double_buffer(meta, model_name):
     for i, m in enumerate(meta):
         if i == 0 or m.get('tile_h', 0) == 0:
             continue
-        if m.get('op_type') not in (0, 1):
+        op = m.get('op_type')
+        if op not in (0, 1, 4):
             continue
-        if m.get('tile_in_size', 0) <= half_bytes:
+        need_bytes = m.get('tile_in_size', 0) * (2 if op == 4 else 1)
+        limit_bytes = IFM_KB * 1024 if op == 4 else half_bytes
+        if need_bytes <= limit_bytes:
             continue
         eb = 2 if m.get('data_type', 0) else 1
+        layer_profile = profile
+        use_db = op != 4
+        if op == 4:
+            layer_profile = HWConfig(
+                act_bank_size=(IFM_KB * 1024) // 2,
+                ofm_bank_size=OFM_KB * 1024,
+                weight_buf_size=WGT_KB * 1024,
+                param_sram_size=PARAM_KB * 1024,
+                param_sram_max_ch=(PARAM_KB * 1024) // 16)
         tile = compute_tiling(
-            op_type=op_names[m['op_type']],
+            op_type=op_names[op],
             in_h=m['in_h'], in_w=m['in_w'], in_c=m['in_c'],
             out_h=m['out_h'], out_w=m['out_w'], out_c=m['out_c'],
             kernel_h=m['kernel_h'], kernel_w=m['kernel_w'],
             stride_h=m['stride_h'], stride_w=m['stride_w'],
-            elem_size=eb, double_buffer=True, profile=DEFAULT_HW)
+            elem_size=eb, double_buffer=use_db, profile=layer_profile)
         th, tw = tile['tile_h'], tile['tile_w']
         in_th = (th - 1) * m['stride_h'] + m['kernel_h']
         in_tw = (tw - 1) * m['stride_w'] + m['kernel_w']
@@ -742,13 +767,14 @@ def self_test():
 def main():
     parser = argparse.ArgumentParser(description='Generate SoC test data for chained model inference')
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument('--model',
-                      choices=['model_x', 'model_x',
-                               'model_x', 'model_x',
-                               'model_c_int16', 'model_c_int8',
-                               'model_x', 'model_x',
-                               'model_e_int16', 'model_e_int8'],
-                      help='Model to generate')
+    def model_name(value):
+        if not re.fullmatch(r'model_[a-z]_int(?:8|16)', value):
+            raise argparse.ArgumentTypeError(
+                'model must be model_<letter>_int8 or model_<letter>_int16')
+        return value
+
+    mode.add_argument('--model', type=model_name,
+                      help='Coded model, e.g. model_x')
     mode.add_argument('--self-test', action='store_true',
                       help='Validate the 37-word binary ABI and exit')
     parser.add_argument('--standalone-layer', type=int, default=-1,
@@ -766,7 +792,7 @@ def main():
     print(f"  {len(meta)} layers loaded")
     prepare_row_weights(meta, data)
     retile_oversize_untiled_adds(meta)
-    if args.model.startswith(('model_x_', 'model_x_')):
+    if args.model.startswith('model_'):
         retile_for_double_buffer(meta, args.model)
     if args.enable_super_block:
         mark_model_x(meta, args.model)

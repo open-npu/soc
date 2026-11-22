@@ -27,9 +27,19 @@ VERILATOR_FLAGS = --cc --exe -O3 \
     -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL \
     -Wno-UNOPTFLAT -Wno-COMBDLY -Wno-LATCH -Wno-CASEINCOMPLETE \
     --top-module $(VERILOG_TOP) \
+    --Mdir $(OBJ_DIR) \
     -I$(NPU_INC_DIR) \
     +define+ACC_WIDTH=44 \
     +define+SYNTHESIS
+
+IFM_KB ?= 32
+OFM_KB ?= 48
+WGT_KB ?= 80
+PARAM_KB ?= 12
+VERILATOR_FLAGS += +define+IFM_KB=$(IFM_KB)
+VERILATOR_FLAGS += +define+OFM_KB=$(OFM_KB)
+VERILATOR_FLAGS += +define+WGT_KB=$(WGT_KB)
+VERILATOR_FLAGS += +define+PARAM_KB=$(PARAM_KB)
 
 # Debug defines (enabled when DEBUG=1)
 ifeq ($(DEBUG),1)
