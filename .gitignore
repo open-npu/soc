@@ -9,6 +9,7 @@ firmware/*.dis
 sim/*.init
 sim/*.log
 sim/obj_dir/
+sim/obj_*/
 sim/Vsim
 sim/core.*
 build/
