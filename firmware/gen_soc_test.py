@@ -199,11 +199,22 @@ def retile_for_double_buffer(meta, model_name):
         op = m.get('op_type')
         if op not in (0, 1, 4):
             continue
+        eb = 2 if m.get('data_type', 0) else 1
         need_bytes = m.get('tile_in_size', 0) * (2 if op == 4 else 1)
         limit_bytes = IFM_KB * 1024 if op == 4 else half_bytes
-        if need_bytes <= limit_bytes:
+        tile_out_bytes = (m.get('tile_h', 0) * m.get('tile_w', 0)
+                          * m.get('out_c', 0) * eb)
+        ofm_limit_bytes = (OFM_KB * 1024) // 2
+        k_depth = (m.get('kernel_h', 1) * m.get('kernel_w', 1)
+                   * m.get('in_c', 1))
+        # Shrinking solely for OFM double buffering helps low-K 1x1 layers
+        # whose compute cannot hide a serial tile store. For compute-heavy
+        # layers the extra tile boundaries cost more than DB overlap saves.
+        ofm_db_worthwhile = op == 0 and k_depth <= 16
+        if (need_bytes <= limit_bytes
+                and (tile_out_bytes <= ofm_limit_bytes
+                     or not ofm_db_worthwhile)):
             continue
-        eb = 2 if m.get('data_type', 0) else 1
         layer_profile = profile
         use_db = op != 4
         if op == 4:
@@ -761,6 +772,23 @@ def self_test():
     blob = build_chained_blob(meta, data)
     hdr = struct.unpack_from('<37I', blob, 12)
     assert hdr[36] == 0
+    # A tile may fit the IFM half but overflow the OFM half. It must still be
+    # re-tiled, otherwise firmware rejects DB_EN and silently runs serially.
+    db_meta = [{'op_type': 3, 'tile_h': 0}, {
+        'op_type': 0, 'data_type': 0,
+        'in_h': 112, 'in_w': 112, 'in_c': 8,
+        'out_h': 112, 'out_w': 112, 'out_c': 48,
+        'kernel_h': 1, 'kernel_w': 1,
+        'stride_h': 1, 'stride_w': 1,
+        'tile_h': 32, 'tile_w': 32,
+        'tile_num_h': 4, 'tile_num_w': 4,
+        'tile_in_size': 32 * 32 * 8,
+        'tile_out_size': 32 * 32 * 48,
+        'sched_ctrl': 1 << 4, 'store_mode': 1,
+    }]
+    retile_for_double_buffer(db_meta, 'model_test')
+    assert db_meta[1]['tile_h'] * db_meta[1]['tile_w'] * 48 <= (OFM_KB * 1024) // 2
+    assert (db_meta[1]['tile_h'], db_meta[1]['tile_w']) != (32, 32)
     print('gen_soc_test self-test: PASS')
 
 
