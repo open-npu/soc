@@ -51,6 +51,9 @@ DEFINES += -DNPU_SPAD_KB_OVERRIDE=$(shell expr $(IFM_KB) + $(OFM_KB) + $(WGT_KB)
 ifeq ($(SUPER_BLOCK),1)
 GEN_SUPER_BLOCK = --enable-super-block
 endif
+ifeq ($(NO_FUSE),1)
+GEN_SUPER_BLOCK += --no-fuse
+endif
 ifeq ($(PERF_ONLY),1)
 DEFINES += -DPERF_ONLY
 endif

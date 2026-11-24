@@ -105,7 +105,7 @@
 #define IRQ_DONE        (1U << 0)
 #define IRQ_ERROR       (1U << 1)
 
-#define MAX_LAYERS 80
+#define MAX_LAYERS 128
 
 /* Must match soc/firmware/build_main_ram.py OUT_POISON.
  * Workspace DDR outputs are initialized to this, not golden. */
@@ -335,14 +335,21 @@ static int layer_db_ok(const uint32_t *e) {
  * START before MID starts, so only the last tile would remain in SRAM.
  * Mixed tiled START + untiled MID (M_X L16→L17) falls back to DDR. A later
  * untiled FUSE_END can still reuse SRAM after that DDR-loaded MID. */
-static int sram_fuse_reuse(const uint32_t *prev, const uint32_t *cur) {
+static int sram_fuse_reuse(const uint32_t *prev, const uint32_t *cur,
+                           uint32_t prev_idx) {
     uint32_t ps, cs, act_base, need_in, need_out, cap;
+    int32_t cur_src;
     if (!prev || !cur || g_act_words == 0)
         return 0;
     if (layer_tile_h(prev) != 0 || layer_tile_h(cur) != 0)
         return 0;
     ps = prev[21];
     cs = cur[21];
+    if (cs & (SCHED_SUPER_BLOCK | SCHED_FUSE_STRIP))
+        return 0;
+    cur_src = (int32_t)cur[34];
+    if (cur_src >= 0 && cur_src != (int32_t)prev_idx)
+        return 0;
     if ((ps & (SCHED_FUSE_START | SCHED_FUSE_MID)) == 0)
         return 0;
     if ((cs & (SCHED_FUSE_MID | SCHED_FUSE_END)) == 0)
@@ -429,8 +436,8 @@ static void npu_program_layer(const uint32_t *e,
     NPU_REG(REG_OUT_DIM_HW) = e[8];
     NPU_REG(REG_OUT_DIM_C)  = e[9];
 
-    /* Kernel, stride, padding */
-    NPU_REG(REG_KERNEL_SIZE) = e[10] & 0xFFFF;
+    /* Kernel + dilation ([31:16]), stride, padding */
+    NPU_REG(REG_KERNEL_SIZE) = e[10];
     NPU_REG(REG_STRIDE)      = e[11];
     NPU_REG(REG_PADDING)     = e[12];
 
@@ -538,7 +545,7 @@ static void program_super_slot(uint32_t slot, const uint32_t *e,
     d[0] = (e[4] & 0xFu) | ((e[5] & 1u) << 4)
          | ((e[28] & 0xFFFFu) << 8);
     d[1] = e[6];  d[2] = e[7];  d[3] = e[8];  d[4] = e[9];
-    d[5] = e[10] & 0xFFFFu;
+    d[5] = e[10];
     d[6] = e[11]; d[7] = e[12];
     if ((e[4] & 0xFu) == 3u) d[8] = e[18];
     d[12] = tile_h | (tile_w << 16);
@@ -564,31 +571,38 @@ static void program_super_slot(uint32_t slot, const uint32_t *e,
         NPU_REG(REG_SUPER_DESC_BASE + i * 4u) = d[i];
 }
 
-static int run_model_x(const uint32_t *a, const uint32_t *dw,
-                             const uint32_t *pw, uint32_t runtime_in_addr) {
+static int run_super_block(const uint32_t *a, const uint32_t *dw,
+                           const uint32_t *pw, uint32_t runtime_in_addr) {
     uint32_t h = a[6] >> 16;
     uint32_t w = a[6] & 0xFFFFu;
-    uint32_t in_c = a[7], mid_c = a[9];
-    uint32_t tile_h, tile_w, tiles_h, tiles_w;
+    uint32_t in_c = a[7], mid_c = a[9], out_c = pw[9];
+    uint32_t tile_h = a[19] & 0xFFFFu;
+    uint32_t tile_w = a[19] >> 16;
+    uint32_t tiles_h = a[20] & 0xFFFFu;
+    uint32_t tiles_w = a[20] >> 16;
     uint32_t wgt0, wgt1, wgt2, param0, param1, param2;
     if ((a[4] & 0xFu) != 0u || (dw[4] & 0xFu) != 1u
             || (pw[4] & 0xFu) != 0u
             || a[5] != 0 || dw[5] != 0 || pw[5] != 0
-            || h != w
-            || !((in_c == 56u && mid_c == 112u)
-                 || (in_c == 96u && mid_c == 192u))
+            || h == 0u || w == 0u
+            || tile_h == 0u || tile_w == 0u
+            || tiles_h == 0u || tiles_w == 0u
+            || in_c == 0u || (in_c & 3u) != 0u
+            || mid_c == 0u || (mid_c & 3u) != 0u
+            || out_c == 0u || (out_c & 3u) != 0u
+            || a[8] != a[6]
             || dw[6] != a[8] || dw[8] != a[8]
-            || dw[7] != mid_c || dw[9] != mid_c || dw[10] != 0x303u
-            || dw[11] != 0x101u || dw[12] != 0x101u
+            || dw[7] != mid_c || dw[9] != mid_c
+            || (a[10] & 0xFFFFu) != 0x0101u
+            || (dw[10] & 0xFFFFu) != 0x0303u
+            || (pw[10] & 0xFFFFu) != 0x0101u
+            || dw[11] != 0x0101u || dw[12] != 0x0101u
             || pw[6] != a[8] || pw[8] != a[8]
-            || pw[7] != mid_c || pw[9] != in_c)
+            || pw[7] != mid_c)
         return -13;
-    if (h == 56u) { tile_h = 28u; tile_w = 10u; }
-    else if (h == 28u) { tile_h = 28u; tile_w = 6u; }
-    else if (h == 14u) { tile_h = 14u; tile_w = 12u; }
-    else return -13;
-    tiles_h = (h + tile_h - 1u) / tile_h;
-    tiles_w = (w + tile_w - 1u) / tile_w;
+
+    NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
+    for (volatile int d = 0; d < 100; d++) {}
 
     /* Word-addressed, naturally aligned, non-overlapping resident regions. */
     wgt0 = 0;
@@ -619,13 +633,12 @@ static int run_model_x(const uint32_t *a, const uint32_t *dw,
 
 /* Execute a large Conv→Pool pair as SRAM-resident full-width strips.
  *
- * Adjacent producer strips overlap when the Pool window is wider than its
- * stride. FUSE_START leaves each producer strip in physical OFM; FUSE_END
- * swaps the activation roles and consumes it without a DDR round trip. Only
- * Pool output reaches DDR, at its final global row offset.
+ * Supports both pre-sliced L0 inputs (input_slot != 0) and general zero-copy
+ * row-sliced NHWC DDR inputs at any layer index (input_slot == 0).
  */
 static int run_conv_pool_strips(const uint32_t *conv_e,
-                                const uint32_t *pool_e) {
+                                const uint32_t *pool_e,
+                                uint32_t runtime_in_addr) {
     uint32_t conv[LAYER_ENTRY_HDR_WORDS];
     uint32_t pool[LAYER_ENTRY_HDR_WORDS];
     uint32_t producer_h = conv_e[19] & 0xFFFFu;
@@ -633,6 +646,9 @@ static int run_conv_pool_strips(const uint32_t *conv_e,
     uint32_t strip_count = conv_e[20] & 0xFFFFu;
     uint32_t pool_strip_h = conv_e[20] >> 16;
     uint32_t input_slot = conv_e[23];
+    uint32_t conv_in_h = conv_e[6] >> 16;
+    uint32_t conv_in_w = conv_e[6] & 0xFFFFu;
+    uint32_t conv_in_c = conv_e[7];
     uint32_t conv_out_h = conv_e[8] >> 16;
     uint32_t pool_out_h = pool_e[8] >> 16;
     uint32_t pool_out_w = pool_e[8] & 0xFFFFu;
@@ -643,32 +659,80 @@ static int run_conv_pool_strips(const uint32_t *conv_e,
     uint32_t pool_sh = (pool_cfg >> 12) & 0xFu;
     uint32_t conv_kh = conv_e[10] & 0xFFu;
     uint32_t conv_kw = (conv_e[10] >> 8) & 0xFFu;
+    uint32_t conv_dh = (conv_e[10] >> 16) & 0xFFu;
     uint32_t conv_sh = conv_e[11] & 0xFFu;
-    uint32_t conv_sw = (conv_e[11] >> 8) & 0xFFu;
-    uint32_t local_in_h = (producer_h - 1u) * conv_sh + conv_kh;
-    uint32_t local_in_w = (producer_w - 1u) * conv_sw + conv_kw;
+    uint32_t conv_sw = conv_e[11] >> 8;
+    uint32_t conv_pad_top = conv_e[12] & 0xFFu;
+    uint32_t conv_pad_left = (conv_e[12] >> 8) & 0xFFu;
+    uint32_t pool_pad_top = pool_e[12] & 0xFFu;
+    uint32_t pool_pad_left = (pool_e[12] >> 8) & 0xFFu;
+    uint32_t kh_eff;
+
+    if (!conv_dh)
+        conv_dh = 1u;
+    conv_sw &= 0xFFu;
+    kh_eff = (conv_kh - 1u) * conv_dh + 1u;
 
     if (!producer_h || !producer_w || !strip_count || !pool_strip_h
-        || !pool_kh || !pool_sh
-        || !input_slot || elem_bytes != 1u)
+        || !pool_kh || !pool_sh || elem_bytes != 1u)
         return -1;
+
+    NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
+    for (volatile int d = 0; d < 100; d++) {}
 
     for (uint32_t s = 0; s < strip_count; s++) {
         uint32_t pool_y = s * pool_strip_h;
         uint32_t valid_pool_h = pool_out_h - pool_y;
-        uint32_t producer_y = pool_y * pool_sh;
-        uint32_t valid_pool_in_h = conv_out_h - producer_y;
+        uint32_t valid_pool_in_h;
+        uint32_t local_pool_pad;
+        uint32_t conv_in_addr;
         if (valid_pool_h > pool_strip_h)
             valid_pool_h = pool_strip_h;
-        if (valid_pool_in_h > producer_h)
-            valid_pool_in_h = producer_h;
 
         copy_layer_entry(conv, conv_e);
-        conv[6] = local_in_w | (local_in_h << 16);
-        conv[8] = producer_w | (producer_h << 16);
-        conv[12] = 0; /* Strip input already contains global zero-point padding. */
-        conv[15] = input_slot;
-        conv[17] = producer_h * producer_w * conv_e[9] * elem_bytes;
+        if (input_slot != 0u) {
+            uint32_t producer_y = pool_y * pool_sh;
+            uint32_t local_in_h = (producer_h - 1u) * conv_sh + conv_kh;
+            uint32_t local_in_w = (producer_w - 1u) * conv_sw + conv_kw;
+            valid_pool_in_h = conv_out_h - producer_y;
+            if (valid_pool_in_h > producer_h)
+                valid_pool_in_h = producer_h;
+            conv_in_addr = runtime_in_addr + s * input_slot;
+            conv[6] = local_in_w | (local_in_h << 16);
+            conv[8] = producer_w | (producer_h << 16);
+            conv[12] = 0;
+            conv[15] = input_slot;
+            conv[17] = producer_h * producer_w * conv_e[9] * elem_bytes;
+            local_pool_pad = pool_e[12];
+        } else {
+            int32_t cy_min = (int32_t)(pool_y * pool_sh) - (int32_t)pool_pad_top;
+            int32_t cy_max = (int32_t)((pool_y + valid_pool_h - 1u) * pool_sh)
+                           - (int32_t)pool_pad_top + (int32_t)pool_kh;
+            uint32_t prod_y0 = (cy_min < 0) ? 0u : (uint32_t)cy_min;
+            uint32_t local_pool_pad_top = (cy_min < 0) ? (uint32_t)(-cy_min) : 0u;
+            uint32_t prod_y1 = (cy_max > (int32_t)conv_out_h)
+                             ? conv_out_h : (uint32_t)cy_max;
+            uint32_t valid_prod_h = prod_y1 - prod_y0;
+
+            int32_t iy_min = (int32_t)(prod_y0 * conv_sh) - (int32_t)conv_pad_top;
+            int32_t iy_max = (int32_t)((prod_y0 + valid_prod_h - 1u) * conv_sh)
+                           - (int32_t)conv_pad_top + (int32_t)kh_eff;
+            uint32_t in_y0 = (iy_min < 0) ? 0u : (uint32_t)iy_min;
+            uint32_t local_conv_pad_top = (iy_min < 0) ? (uint32_t)(-iy_min) : 0u;
+            uint32_t in_y1 = (iy_max > (int32_t)conv_in_h)
+                           ? conv_in_h : (uint32_t)iy_max;
+            uint32_t local_conv_in_h = in_y1 - in_y0;
+            uint32_t row_bytes = conv_in_w * conv_in_c * elem_bytes;
+
+            conv_in_addr = runtime_in_addr + in_y0 * row_bytes;
+            conv[6] = conv_in_w | (local_conv_in_h << 16);
+            conv[8] = producer_w | (valid_prod_h << 16);
+            conv[12] = local_conv_pad_top | (conv_pad_left << 8);
+            conv[15] = (local_conv_in_h * row_bytes + 3u) & ~3u;
+            conv[17] = (valid_prod_h * producer_w * conv_e[9] * elem_bytes + 3u) & ~3u;
+            valid_pool_in_h = valid_prod_h;
+            local_pool_pad = local_pool_pad_top | (pool_pad_left << 8);
+        }
         conv[19] = 0;
         conv[20] = 0x00010001u;
         conv[21] = SCHED_FUSE_START;
@@ -678,7 +742,7 @@ static int run_conv_pool_strips(const uint32_t *conv_e,
         conv[25] = 0;
 
         NPU_REG(REG_IRQ_STATUS) = 0x7;
-        npu_program_layer(conv, conv_e[32] + s * input_slot, 0, 0,
+        npu_program_layer(conv, conv_in_addr, 0, 0,
                           SCHED_FUSE_START, 0, 0, 0, 0, 0);
         dcache_flush();
         NPU_REG(REG_CTRL) = CTRL_START;
@@ -689,6 +753,7 @@ static int run_conv_pool_strips(const uint32_t *conv_e,
         copy_layer_entry(pool, pool_e);
         pool[6] = producer_w | (valid_pool_in_h << 16);
         pool[8] = pool_out_w | (valid_pool_h << 16);
+        pool[12] = local_pool_pad;
         pool[15] = 0;
         pool[17] = valid_pool_h * pool_out_w * pool_out_c * elem_bytes;
         pool[19] = 0;
@@ -713,6 +778,134 @@ static int run_conv_pool_strips(const uint32_t *conv_e,
     return 0;
 }
 
+/* Execute a single tiled Conv/DW/Pool layer whose sub-word channel pitch
+ * ((in_c * elem_bytes) % 4 != 0) would misalign 2D-DMA column/halo word
+ * math, by running full-width untiled NHWC row strips. */
+static int need_row_strip_fallback(const uint32_t *e, uint32_t l) {
+    uint32_t op = e[4] & 0xFu;
+    uint32_t eb = (e[5] & 1u) ? 2u : 1u;
+    uint32_t in_c = e[7];
+    uint32_t tile_w = e[19] >> 16;
+    uint32_t tiles_w = e[20] >> 16;
+    uint32_t kw, dw, sw, pad_left, tile_in_w;
+    if (l == 0u || layer_tile_h(e) == 0u || tile_w == 0u)
+        return 0;
+    if (((in_c * eb) & 3u) == 0u)
+        return 0;
+    if (op != 0u && op != 1u && op != 3u)
+        return 0;
+    if (e[26] != 0u)
+        return 0;
+    if (op == 3u) {
+        kw = (e[18] >> 8) & 0xFu;
+        sw = (e[18] >> 16) & 0xFu;
+        dw = 1u;
+    } else {
+        kw = (e[10] >> 8) & 0xFFu;
+        dw = (e[10] >> 24) & 0xFFu;
+        if (!dw) dw = 1u;
+        sw = (e[11] >> 8) & 0xFFu;
+    }
+    pad_left = (e[12] >> 8) & 0xFFu;
+    tile_in_w = (tile_w - 1u) * sw + (kw - 1u) * dw + 1u;
+    if (((tile_in_w * in_c * eb) & 3u) != 0u)
+        return 1;
+    if (((pad_left * in_c * eb) & 3u) != 0u)
+        return 1;
+    if (tiles_w > 1u && ((((tile_w * sw - pad_left) * in_c * eb) & 3u) != 0u))
+        return 1;
+    return 0;
+}
+
+static int run_layer_row_strips(const uint32_t *e, uint32_t runtime_in_addr) {
+    uint32_t sub[LAYER_ENTRY_HDR_WORDS];
+    uint32_t op = e[4] & 0xFu;
+    uint32_t eb = (e[5] & 1u) ? 2u : 1u;
+    uint32_t in_h = e[6] >> 16;
+    uint32_t in_w = e[6] & 0xFFFFu;
+    uint32_t in_c = e[7];
+    uint32_t out_h = e[8] >> 16;
+    uint32_t out_w = e[8] & 0xFFFFu;
+    uint32_t out_c = e[9];
+    uint32_t kh, dh, sh, pad_top, pad_left, kh_eff;
+    uint32_t in_row_bytes = in_w * in_c * eb;
+    uint32_t out_row_bytes = out_w * out_c * eb;
+    uint32_t ifm_bytes = g_act_words * 4u;
+    uint32_t ofm_bytes = g_ofm_words * 4u;
+    uint32_t strip_h = 0u;
+
+    if ((in_row_bytes & 3u) != 0u || (out_row_bytes & 3u) != 0u)
+        return -1;
+    if (op == 3u) {
+        kh = (e[18] >> 4) & 0xFu;
+        sh = (e[18] >> 12) & 0xFu;
+        dh = 1u;
+    } else {
+        kh = e[10] & 0xFFu;
+        dh = (e[10] >> 16) & 0xFFu;
+        if (!dh) dh = 1u;
+        sh = e[11] & 0xFFu;
+    }
+    pad_top = e[12] & 0xFFu;
+    pad_left = (e[12] >> 8) & 0xFFu;
+    kh_eff = (kh - 1u) * dh + 1u;
+
+    for (uint32_t cand = 1u; cand <= out_h; cand++) {
+        uint32_t need_in_h = (cand - 1u) * sh + kh_eff;
+        if (need_in_h > in_h)
+            need_in_h = in_h;
+        if (need_in_h * in_row_bytes > ifm_bytes
+                || cand * out_row_bytes > ofm_bytes)
+            break;
+        strip_h = cand;
+    }
+    if (strip_h == 0u)
+        return -2;
+
+    NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
+    for (volatile int d = 0; d < 100; d++) {}
+
+    for (uint32_t out_y0 = 0u; out_y0 < out_h; out_y0 += strip_h) {
+        uint32_t valid_out_h = out_h - out_y0;
+        int32_t iy_min, iy_max;
+        uint32_t in_y0, in_y1, local_in_h, local_pad_top;
+        if (valid_out_h > strip_h)
+            valid_out_h = strip_h;
+        iy_min = (int32_t)(out_y0 * sh) - (int32_t)pad_top;
+        iy_max = (int32_t)((out_y0 + valid_out_h - 1u) * sh)
+               - (int32_t)pad_top + (int32_t)kh_eff;
+        in_y0 = (iy_min < 0) ? 0u : (uint32_t)iy_min;
+        local_pad_top = (iy_min < 0) ? (uint32_t)(-iy_min) : 0u;
+        in_y1 = (iy_max > (int32_t)in_h) ? in_h : (uint32_t)iy_max;
+        local_in_h = in_y1 - in_y0;
+
+        copy_layer_entry(sub, e);
+        sub[6]  = in_w | (local_in_h << 16);
+        sub[8]  = out_w | (valid_out_h << 16);
+        sub[12] = local_pad_top | (pad_left << 8);
+        sub[15] = local_in_h * in_row_bytes;
+        sub[17] = valid_out_h * out_row_bytes;
+        sub[19] = 0;
+        sub[20] = 0x00010001u;
+        sub[21] = 0;
+        sub[22] = 0;
+        sub[23] = 0;
+        sub[24] = 0;
+        sub[25] = 0;
+        sub[31] = e[31] + out_y0 * out_row_bytes;
+
+        NPU_REG(REG_IRQ_STATUS) = 0x7;
+        npu_program_layer(sub, runtime_in_addr + in_y0 * in_row_bytes,
+                          0, 0, 0, 0, 0, 0, 0, 0);
+        dcache_flush();
+        NPU_REG(REG_CTRL) = CTRL_START;
+        dcache_flush();
+        if (npu_wait_done() != 0)
+            return -3;
+    }
+    return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Chained model inference
  *  ═══════════════════════════════════════════════════════════════════ */
@@ -728,7 +921,7 @@ typedef struct {
  * Reading the counters still costs a few thousand cycles per model, so the
  * snapshot is behind PERF_HIST: a plain PERF_ONLY build measures the
  * production interval untouched, and HIST=1 builds add the breakdown. */
-#define PERF_LAYER_MAX 80
+#define PERF_LAYER_MAX 128
 static uint32_t perf_layer_log[PERF_LAYER_MAX * 14];
 static int      perf_layer_idx;
 #ifdef PERF_HIST
@@ -810,6 +1003,7 @@ static int run_chained_model(test_case_t *tc) {
     npu_reset();
     int total_err = 0;
     int param_preloaded = 0;
+    int prev_kept_in_sram = 0;
 #ifdef PERF_ONLY
     perf_layer_idx = 0;
 #endif
@@ -835,9 +1029,12 @@ static int run_chained_model(test_case_t *tc) {
             const uint32_t *pw_cursor =
                 dw_cursor + LAYER_ENTRY_HDR_WORDS
                 + dw_cursor[0] + dw_cursor[1] + dw_cursor[2] + dw_cursor[3];
-            uint32_t runtime_in_addr = (l == 0) ? e[32] : layer_out_addr[l - 1];
-            int ret = run_model_x(e, dw_cursor, pw_cursor,
-                                        runtime_in_addr);
+            int32_t in_src = (int32_t)e[34];
+            uint32_t runtime_in_addr = (l == 0) ? e[32]
+                : ((in_src >= 0 && in_src < (int32_t)num_layers)
+                   ? layer_out_addr[in_src] : layer_out_addr[l - 1]);
+            int ret = run_super_block(e, dw_cursor, pw_cursor,
+                                      runtime_in_addr);
             if (ret != 0) {
                 uart_puts("  SUPER ERROR at L");
                 uart_put_dec(l);
@@ -850,6 +1047,7 @@ static int run_chained_model(test_case_t *tc) {
             }
             param_preloaded = 0;
             param_bank = 0;
+            prev_kept_in_sram = 0;
 #ifdef PERF_ONLY
 #ifdef PERF_HIST
             /* One HW transaction represents three logical model layers.
@@ -911,35 +1109,28 @@ static int run_chained_model(test_case_t *tc) {
         if ((e[21] & SCHED_FUSE_STRIP) && next) {
             const uint32_t *pool_cursor =
                 cursor + LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2] + e[3];
-            int ret = run_conv_pool_strips(e, next);
+            int32_t in_src = (int32_t)e[34];
+            uint32_t runtime_in_addr = (l == 0) ? e[32]
+                : ((in_src >= 0 && in_src < (int32_t)num_layers)
+                   ? layer_out_addr[in_src] : layer_out_addr[l - 1]);
+            int ret = run_conv_pool_strips(e, next, runtime_in_addr);
             if (ret != 0) {
-                uart_puts("  L0->L1 STRIP FUSION ERROR ");
+                uart_puts("  L");
+                uart_put_dec(l);
+                uart_puts("->L");
+                uart_put_dec(l + 1);
+                uart_puts(" STRIP FUSION ERROR ");
                 uart_put_dec((uint32_t)(-ret));
                 uart_putc('\n');
                 return -1;
             }
             param_preloaded = 0;
             param_bank = 0;
+            prev_kept_in_sram = 0;
 #ifdef PERF_ONLY
 #ifdef PERF_HIST
-            if (perf_layer_idx < PERF_LAYER_MAX) {
-                uint32_t *p = &perf_layer_log[perf_layer_idx * 14];
-                p[0]  = NPU_REG(REG_ST_MAC);
-                p[1]  = NPU_REG(REG_ST_WAIT);
-                p[2]  = NPU_REG(REG_ST_WB);
-                p[3]  = NPU_REG(REG_ST_POOL);
-                p[4]  = NPU_REG(REG_ST_ADD);
-                p[5]  = NPU_REG(REG_ST_RSZ);
-                p[6]  = NPU_REG(REG_ST_CFG);
-                p[7]  = NPU_REG(REG_ST_OTH);
-                p[8]  = NPU_REG(REG_WT_ACT);
-                p[9]  = NPU_REG(REG_WT_WGT);
-                p[10] = NPU_REG(REG_WT_DB);
-                p[11] = NPU_REG(REG_MAC_IDLE);
-                p[12] = NPU_REG(REG_PERF_DMA);
-                p[13] = NPU_REG(REG_WT_STORE);
-                perf_layer_idx++;
-            }
+            perf_hist_push(0);
+            perf_hist_push(1);
 #endif
 #else
             dcache_flush();
@@ -954,7 +1145,9 @@ static int run_chained_model(test_case_t *tc) {
                 for (uint32_t i = 0; i < n_output; i++) {
                     if (out_ptr[i] != golden[i]) {
                         if (mismatches < 10) {
-                            uart_puts("  L1 fused w[");
+                            uart_puts("  L");
+                            uart_put_dec(l + 1);
+                            uart_puts(" fused w[");
                             uart_put_dec(i);
                             uart_puts("]: exp=0x");
                             uart_put_hex32(golden[i]);
@@ -966,13 +1159,21 @@ static int run_chained_model(test_case_t *tc) {
                     }
                 }
                 if (mismatches) {
-                    uart_puts("  L0->L1 STRIP FUSION FAIL: ");
+                    uart_puts("  L");
+                    uart_put_dec(l);
+                    uart_puts("->L");
+                    uart_put_dec(l + 1);
+                    uart_puts(" STRIP FUSION FAIL: ");
                     uart_put_dec(mismatches);
                     uart_puts(" mismatches\n");
                     total_err += mismatches;
                 } else {
-                    uart_puts("  L0: PASS (Conv output kept in SRAM strips)\n");
-                    uart_puts("  L1: PASS (Conv->Pool strip fusion, ");
+                    uart_puts("  L");
+                    uart_put_dec(l);
+                    uart_puts(": PASS (Conv output kept in SRAM strips)\n");
+                    uart_puts("  L");
+                    uart_put_dec(l + 1);
+                    uart_puts(": PASS (Conv->Pool strip fusion, ");
                     uart_put_dec(n_output);
                     uart_puts(" words)\n");
                 }
@@ -980,18 +1181,22 @@ static int run_chained_model(test_case_t *tc) {
 #endif
             cursor = pool_cursor + LAYER_ENTRY_HDR_WORDS
                    + next[0] + next[1] + next[2] + next[3];
-            l++; /* L1 was consumed by the strip scheduler. */
+            l++; /* Pool layer was consumed by the strip scheduler. */
             continue;
         }
 
-        int reuse = sram_fuse_reuse(prev, e);
-        /* Keep FUSE_START on an untiled producer only if the next layer
-         * will actually skip_act_load. Otherwise START must store to DDR. */
-        int keep_fuse = reuse;
-        if (!keep_fuse && next && (e[21] & SCHED_FUSE_START) && layer_tile_h(e) == 0
-            && sram_fuse_reuse(e, next))
-            keep_fuse = 1;
-        uint32_t dma_ctrl = keep_fuse ? e[21] : (e[21] & ~SCHED_FUSE_MASK);
+        int in_from_sram = prev_kept_in_sram && (l > 0)
+                           && sram_fuse_reuse(prev, e, l - 1);
+        int out_to_sram  = (next != 0)
+                           && ((e[21] & (SCHED_FUSE_START | SCHED_FUSE_MID)) != 0)
+                           && layer_tile_h(e) == 0
+                           && sram_fuse_reuse(e, next, l);
+        int reuse = in_from_sram;
+        uint32_t fuse_bits = 0;
+        if (in_from_sram && out_to_sram)        fuse_bits = SCHED_FUSE_MID;
+        else if (!in_from_sram && out_to_sram)  fuse_bits = SCHED_FUSE_START;
+        else if (in_from_sram && !out_to_sram)  fuse_bits = SCHED_FUSE_END;
+        uint32_t dma_ctrl = (e[21] & ~SCHED_FUSE_MASK) | fuse_bits;
         /* Enable double buffering on any tiled layer whose tile plus its
          * branch-B tensor fits one bank half. Without this every tile
          * boundary stalls compute for the store plus the next prefetch.
@@ -1000,8 +1205,7 @@ static int run_chained_model(test_case_t *tc) {
         if ((dma_ctrl & SCHED_DB_EN) == 0 && (e[22] & 1u) && layer_db_ok(e))
             dma_ctrl |= SCHED_DB_EN;
 #ifndef PERF_ONLY
-        int skip_store = keep_fuse && layer_tile_h(e) == 0
-                         && (e[21] & (SCHED_FUSE_START | SCHED_FUSE_MID));
+        int skip_store = out_to_sram;
 #endif
 
         uint32_t op_type = e[4];
@@ -1041,51 +1245,63 @@ static int run_chained_model(test_case_t *tc) {
             runtime_add_b_addr = e[33];  /* fallback: metadata's ddr_add_b_addr */
         }
 
-        /* Preserve Act SRAM across FUSE_MID/END. Soft-reset otherwise so a
-         * mixed tiled→untiled block cannot read a stale tiled layout. */
-        if (l > 0 && !reuse) {
-            NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
-            for (volatile int d = 0; d < 100; d++) {}
-        }
-        NPU_REG(REG_IRQ_STATUS) = 0x7;  /* always W1C before START */
+        /* Sub-word input channel pitch on 2D-DMA tiled layers: execute as
+         * contiguous 1D NHWC row strips so word-granularity DMA stays exact. */
+        int ret;
+        if (need_row_strip_fallback(e, l)) {
+            ret = run_layer_row_strips(e, runtime_in_addr);
+            param_preloaded = 0;
+            param_bank = 0;
+            prev_kept_in_sram = 0;
+        } else {
+            /* Preserve Act SRAM across FUSE_MID/END. Soft-reset otherwise so a
+             * mixed tiled→untiled block cannot read a stale tiled layout. */
+            if (l > 0 && !reuse) {
+                NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
+                for (volatile int d = 0; d < 100; d++) {}
+            }
+            NPU_REG(REG_IRQ_STATUS) = 0x7;  /* always W1C before START */
 
-        uint32_t act_base = reuse ? layer_out_base(prev) : 0;
+            uint32_t act_base = reuse ? layer_out_base(prev) : 0;
 
-        uint32_t next_param_words = 0;
-        uint32_t next_param_addr = 0;
-        uint32_t next_param_bank = param_bank ^ 1u;
-        if (next && e[19] == 0
-            && layer_param_words(e) <= param_half_words
-            && layer_param_words(next) <= param_half_words) {
-            next_param_words = layer_param_words(next);
-            next_param_addr = next[30];
-        }
+            uint32_t next_param_words = 0;
+            uint32_t next_param_addr = 0;
+            uint32_t next_param_bank = param_bank ^ 1u;
+            if (next && e[19] == 0
+                && ((next[21] & (SCHED_SUPER_BLOCK | SCHED_FUSE_STRIP)) == 0)
+                && layer_param_words(e) <= param_half_words
+                && layer_param_words(next) <= param_half_words) {
+                next_param_words = layer_param_words(next);
+                next_param_addr = next[30];
+            }
 
-        npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, act_base, dma_ctrl,
-                          param_preloaded, param_bank,
-                          next_param_addr, next_param_words, next_param_bank);
-        dcache_flush();
+            npu_program_layer(e, runtime_in_addr, runtime_add_b_addr, act_base, dma_ctrl,
+                              param_preloaded, param_bank,
+                              next_param_addr, next_param_words, next_param_bank);
+            dcache_flush();
 #ifndef PERF_ONLY
-        if (l < 3 || (e[21] & SCHED_FUSE_MASK)) {
-            uart_puts("  DBG L"); uart_put_dec(l);
-            uart_puts(": in_addr=0x"); uart_put_hex32(runtime_in_addr);
-            uart_puts(" e32=0x"); uart_put_hex32(e[32]);
-            uart_puts(" in_stride=0x"); uart_put_hex32(NPU_REG(0x110));
-            uart_puts(" act_base="); uart_put_dec(act_base);
-            uart_puts(" dma_ctrl=0x"); uart_put_hex32(NPU_REG(REG_DMA_CTRL));
-            uart_puts(reuse ? " SRAM_FUSE\n" : "\n");
-        }
+            if (l < 3 || (e[21] & SCHED_FUSE_MASK)) {
+                uart_puts("  DBG L"); uart_put_dec(l);
+                uart_puts(": in_addr=0x"); uart_put_hex32(runtime_in_addr);
+                uart_puts(" e32=0x"); uart_put_hex32(e[32]);
+                uart_puts(" in_stride=0x"); uart_put_hex32(NPU_REG(0x110));
+                uart_puts(" act_base="); uart_put_dec(act_base);
+                uart_puts(" dma_ctrl=0x"); uart_put_hex32(NPU_REG(REG_DMA_CTRL));
+                uart_puts(reuse ? " SRAM_FUSE\n" : "\n");
+            }
 #endif
 
-        /* Start NPU */
-        NPU_REG(REG_CTRL) = CTRL_START;
-        dcache_flush();  /* Ensure CTRL_START reaches NPU */
+            /* Start NPU */
+            NPU_REG(REG_CTRL) = CTRL_START;
+            dcache_flush();  /* Ensure CTRL_START reaches NPU */
 
-        /* Wait for completion */
-        int ret = npu_wait_done();
-        param_preloaded = next_param_words
-            && (NPU_REG(REG_NEXT_PARAM_STATUS) & 1u);
-        param_bank = param_preloaded ? next_param_bank : 0;
+            /* Wait for completion */
+            ret = npu_wait_done();
+            param_preloaded = next_param_words
+                && (NPU_REG(REG_NEXT_PARAM_STATUS) & 1u);
+            param_bank = param_preloaded ? next_param_bank : 0;
+            prev_kept_in_sram = (ret == 0) ? out_to_sram : 0;
+        }
         /* Perf counters: busy cycles + MAC issues since last soft-rst */
 #ifndef PERF_ONLY
         uint32_t perf_npu     = NPU_REG(REG_PERF_CYCLES);

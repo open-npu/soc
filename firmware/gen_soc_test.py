@@ -192,12 +192,18 @@ def retile_for_double_buffer(meta, model_name):
     op_names = {0: 'conv', 1: 'dw', 2: 'fc', 3: 'pool',
                 4: 'add', 5: 'resize', 6: 'deconv', 7: 'concat'}
     half_bytes = (IFM_DEPTH_WORDS // 2) * 4
+    super_member = set()
+    for idx_s, ms in enumerate(meta):
+        if ms.get('sched_ctrl', 0) & (1 << 7):
+            super_member.update((idx_s, idx_s + 1, idx_s + 2))
     changed = []
     for i, m in enumerate(meta):
-        if i == 0 or m.get('tile_h', 0) == 0:
+        if i == 0 or i in super_member or m.get('tile_h', 0) == 0:
             continue
         op = m.get('op_type')
         if op not in (0, 1, 4):
+            continue
+        if m.get('wgt_per_oc_words', 0) != 0 or (m.get('store_mode', 0) & 2):
             continue
         eb = 2 if m.get('data_type', 0) else 1
         need_bytes = m.get('tile_in_size', 0) * (2 if op == 4 else 1)
@@ -230,10 +236,15 @@ def retile_for_double_buffer(meta, model_name):
             out_h=m['out_h'], out_w=m['out_w'], out_c=m['out_c'],
             kernel_h=m['kernel_h'], kernel_w=m['kernel_w'],
             stride_h=m['stride_h'], stride_w=m['stride_w'],
+            dilation_h=m.get('dilation_h', 1), dilation_w=m.get('dilation_w', 1),
             elem_size=eb, double_buffer=use_db, profile=layer_profile)
         th, tw = tile['tile_h'], tile['tile_w']
-        in_th = (th - 1) * m['stride_h'] + m['kernel_h']
-        in_tw = (tw - 1) * m['stride_w'] + m['kernel_w']
+        dh = max(1, m.get('dilation_h', 1))
+        dw = max(1, m.get('dilation_w', 1))
+        kh_eff = (m['kernel_h'] - 1) * dh + 1
+        kw_eff = (m['kernel_w'] - 1) * dw + 1
+        in_th = (th - 1) * m['stride_h'] + kh_eff
+        in_tw = (tw - 1) * m['stride_w'] + kw_eff
         in_words = (in_th * in_tw * m['in_c'] * eb + 3) // 4
         out_words = (th * tw * m['out_c'] * eb + 3) // 4
         if in_words * 4 > half_bytes:
@@ -252,114 +263,182 @@ def retile_for_double_buffer(meta, model_name):
         print(f"  {model_name} DB re-tiles: {changed}")
 
 
-def mark_model_x(meta, model_name):
-    """Mark all strict stride-1 inverted-residual blocks supported by RTL."""
-    if model_name != 'model_x':
-        return
-    for layer in meta:
-        layer['sched_ctrl'] = layer.get('sched_ctrl', 0) & ~(1 << 7)
-    tile_for_hw = {56: (28, 10), 28: (28, 6), 14: (14, 12)}
-    marked = []
-    for i in range(len(meta) - 2):
-        a, b, c = meta[i:i + 3]
-        h = a['in_h']
-        exact = (
-            (a['op_type'], b['op_type'], c['op_type']) == (0, 1, 0)
-            and h in tile_for_hw and a['in_w'] == h
-            and (a['in_c'], a['out_c']) in ((56, 112), (96, 192))
-            and (a['out_h'], a['out_w']) == (h, h)
-            and (b['in_h'], b['in_w'], b['out_h'], b['out_w']) == (h, h, h, h)
-            and (b['in_c'], b['out_c'], b['kernel_h'], b['kernel_w'],
-                 b['stride_h'], b['stride_w'], b['pad_top'], b['pad_left'])
-                == (a['out_c'], a['out_c'], 3, 3, 1, 1, 1, 1)
-            and (c['in_h'], c['in_w'], c['out_h'], c['out_w']) == (h, h, h, h)
-            and (c['in_c'], c['out_c'], c['kernel_h'], c['kernel_w'],
-                 c['stride_h'], c['stride_w'])
-                == (a['out_c'], a['in_c'], 1, 1, 1, 1)
-            and all(x['data_type'] == 0 for x in (a, b, c))
-        )
-        if exact:
-            th, tw = tile_for_hw[h]
-            for x in (a, b, c):
-                x['tile_h'], x['tile_w'] = th, tw
-                x['tile_num_h'] = (h + th - 1) // th
-                x['tile_num_w'] = (h + tw - 1) // tw
-                x['sched_ctrl'] &= ~0x1f
-                x['store_mode'] = 1
-            a['sched_ctrl'] |= 1 << 7
-            marked.append(i)
-    expected = [6, 10, 14, 18, 25, 29, 33, 37, 41, 45, 52, 56]
-    if marked != expected:
-        raise ValueError(f"model_x strict super blocks changed: {marked}")
-    print(f"  Marked strict super blocks: {marked}")
+def strip_pre_applied_fusions(meta, data):
+    """Undo converter-stamped cross-layer fusion flags so --no-fuse runs every
+    layer independently with valid per-tile store and L0 input packing.
+    """
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, 'tools', 'internal'))
+    from bin2golden import LayerConfig, pack_input_to_words
+
+    if meta and (meta[0].get('sched_ctrl', 0) & (1 << 5)) and meta[0].get('tile_h', 0) > 0:
+        m0 = meta[0]
+        eb0 = 2 if m0.get('data_type', 0) else 1
+        dt0 = np.int16 if eb0 == 2 else np.int8
+        n_elem = m0['in_h'] * m0['in_w'] * m0['in_c']
+        raw_nhwc = data[0]['input'].view(dt0)[:n_elem].reshape(
+            m0['in_h'], m0['in_w'], m0['in_c'])
+        lc0 = LayerConfig()
+        for k in ('op_type', 'data_type', 'in_h', 'in_w', 'in_c',
+                  'out_h', 'out_w', 'out_c', 'kernel_h', 'kernel_w',
+                  'dilation_h', 'dilation_w', 'stride_h', 'stride_w',
+                  'pad_top', 'pad_left', 'tile_h', 'tile_w',
+                  'tile_num_h', 'tile_num_w', 'in_zp', 'pool_cfg'):
+            if k == 'pool_cfg':
+                p = m0.get('pool_cfg', 0)
+                lc0.pool_mode = p & 0x3
+                lc0.pool_h = (p >> 4) & 0xF
+                lc0.pool_w = (p >> 8) & 0xF
+                lc0.pool_stride_h = (p >> 12) & 0xF
+                lc0.pool_stride_w = (p >> 16) & 0xF
+            elif k in m0:
+                setattr(lc0, k, m0[k])
+        lc0.sched_ctrl = 0x10
+        data[0]['input'] = pack_input_to_words(raw_nhwc, lc0)
+        m0['n_input_words'] = len(data[0]['input'])
+
+    for i, m in enumerate(meta):
+        m['sched_ctrl'] = m.get('sched_ctrl', 0) & ~0xAE
+        th, tw = m.get('tile_h', 0), m.get('tile_w', 0)
+        if th > 0 and tw > 0:
+            eb = 2 if m.get('data_type', 0) else 1
+            op = m.get('op_type', 0)
+            if op == 3:
+                p = m.get('pool_cfg', 0)
+                kh, kw = (p >> 4) & 0xF, (p >> 8) & 0xF
+                sh, sw = max(1, (p >> 12) & 0xF), max(1, (p >> 16) & 0xF)
+                dh, dw = 1, 1
+            elif op in (4, 5, 7):
+                kh, kw, sh, sw, dh, dw = 1, 1, 1, 1, 1, 1
+            else:
+                kh, kw = m.get('kernel_h', 1), m.get('kernel_w', 1)
+                sh, sw = max(1, m.get('stride_h', 1)), max(1, m.get('stride_w', 1))
+                dh, dw = max(1, m.get('dilation_h', 1)), max(1, m.get('dilation_w', 1))
+            in_th = (th - 1) * sh + (kh - 1) * dh + 1
+            in_tw = (tw - 1) * sw + (kw - 1) * dw + 1
+            in_words = (in_th * in_tw * m['in_c'] * eb + 3) // 4
+            out_words = (th * tw * m['out_c'] * eb + 3) // 4
+            nt = max(1, m.get('tile_num_h', 1)) * max(1, m.get('tile_num_w', 1))
+            m['tile_in_size'] = in_words * 4
+            m['dma_in_size'] = in_words * 4 * nt
+            m['tile_out_size'] = out_words * 4
+            m['row_cfg'] = (th << 16) | ((tw * m['out_c'] * eb + 3) // 4)
+            m['store_mode'] = m.get('store_mode', 0) | 1
+            m['sched_ctrl'] |= (1 << 4)
 
 
-def enable_untiled_sram_fusion(meta, model_name):
-    """Fuse safe untiled producer/consumer pairs through activation SRAM."""
-    referenced = set()
-    for m in meta:
-        for key in ('input_src', 'residual_src'):
-            if m.get(key, -1) >= 0:
-                referenced.add(m[key])
+def strip_pre_applied_fusions(meta, data):
+    """Undo converter-stamped cross-layer fusion flags so --no-fuse runs every
+    layer independently with valid per-tile store and L0 input packing.
+    """
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, 'tools', 'internal'))
+    from bin2golden import LayerConfig, pack_input_to_words
 
-    changed = []
-    i = 0
-    while i + 1 < len(meta):
-        prod, cons = meta[i], meta[i + 1]
-        if i + 2 < len(meta):
-            end = meta[i + 2]
-            end_words = ((end['out_h'] * end['out_w'] * end['out_c']
-                          * (2 if end.get('data_type', 0) else 1)) + 3) // 4
-            triple = (
-                prod.get('op_type') == 0
-                and cons.get('op_type') == 1
-                and end.get('op_type') == 0
-                and prod.get('kernel_h') == 1 and prod.get('kernel_w') == 1
-                and end.get('kernel_h') == 1 and end.get('kernel_w') == 1
-                and prod.get('tile_h', 0) == 0
-                and cons.get('tile_h', 0) == 0
-                and end.get('tile_h', 0) == 0
-                and i not in referenced and (i + 1) not in referenced
-                and prod['out_h'] == cons['in_h']
-                and prod['out_w'] == cons['in_w']
-                and prod['out_c'] == cons['in_c']
-                and cons['out_h'] == end['in_h']
-                and cons['out_w'] == end['in_w']
-                and cons['out_c'] == end['in_c']
-                and end_words <= IFM_DEPTH_WORDS
-            )
-            if triple:
-                prod['sched_ctrl'] = (prod.get('sched_ctrl', 0) & ~0x0E) | (1 << 1)
-                cons['sched_ctrl'] = (cons.get('sched_ctrl', 0) & ~0x0E) | (1 << 2)
-                end['sched_ctrl'] = (end.get('sched_ctrl', 0) & ~0x0E) | (1 << 3)
-                changed.append((i, i + 1, i + 2))
-                i += 3
-                continue
-        eb = 2 if prod.get('data_type', 0) else 1
-        prod_words = (prod['out_h'] * prod['out_w'] * prod['out_c'] * eb + 3) // 4
-        cons_words = (cons['out_h'] * cons['out_w'] * cons['out_c'] * eb + 3) // 4
-        safe = (
-            prod.get('op_type') in (0, 1, 3)
-            and cons.get('op_type') in (0, 1, 2, 3)
-            and prod.get('tile_h', 0) == 0
-            and cons.get('tile_h', 0) == 0
-            and i not in referenced
-            and prod['out_h'] == cons['in_h']
-            and prod['out_w'] == cons['in_w']
-            and prod['out_c'] == cons['in_c']
-            and prod_words <= IFM_DEPTH_WORDS
-            and cons_words <= IFM_DEPTH_WORDS
-        )
-        if safe:
-            prod['sched_ctrl'] = (prod.get('sched_ctrl', 0) & ~0x0E) | (1 << 1)
-            cons['sched_ctrl'] = (cons.get('sched_ctrl', 0) & ~0x0E) | (1 << 3)
-            changed.append((i, i + 1))
-            i += 2
-        else:
-            i += 1
-    if changed:
-        print(f"  {model_name} SRAM-fused pairs: {changed}")
-    return changed
+    if meta and (meta[0].get('sched_ctrl', 0) & (1 << 5)) and meta[0].get('tile_h', 0) > 0:
+        m0 = meta[0]
+        eb0 = 2 if m0.get('data_type', 0) else 1
+        dt0 = np.int16 if eb0 == 2 else np.int8
+        n_elem = m0['in_h'] * m0['in_w'] * m0['in_c']
+        raw_nhwc = data[0]['input'].view(dt0)[:n_elem].reshape(
+            m0['in_h'], m0['in_w'], m0['in_c'])
+        lc0 = LayerConfig()
+        for k in ('op_type', 'data_type', 'in_h', 'in_w', 'in_c',
+                  'out_h', 'out_w', 'out_c', 'kernel_h', 'kernel_w',
+                  'dilation_h', 'dilation_w', 'stride_h', 'stride_w',
+                  'pad_top', 'pad_left', 'tile_h', 'tile_w',
+                  'tile_num_h', 'tile_num_w', 'in_zp', 'pool_cfg'):
+            if k == 'pool_cfg':
+                p = m0.get('pool_cfg', 0)
+                lc0.pool_mode = p & 0x3
+                lc0.pool_h = (p >> 4) & 0xF
+                lc0.pool_w = (p >> 8) & 0xF
+                lc0.pool_stride_h = (p >> 12) & 0xF
+                lc0.pool_stride_w = (p >> 16) & 0xF
+            elif k in m0:
+                setattr(lc0, k, m0[k])
+        lc0.sched_ctrl = 0x10
+        data[0]['input'] = pack_input_to_words(raw_nhwc, lc0)
+        m0['n_input_words'] = len(data[0]['input'])
+
+    for i, m in enumerate(meta):
+        m['sched_ctrl'] = m.get('sched_ctrl', 0) & ~0xAE
+        th, tw = m.get('tile_h', 0), m.get('tile_w', 0)
+        if th > 0 and tw > 0:
+            eb = 2 if m.get('data_type', 0) else 1
+            op = m.get('op_type', 0)
+            if op == 3:
+                p = m.get('pool_cfg', 0)
+                kh, kw = (p >> 4) & 0xF, (p >> 8) & 0xF
+                sh, sw = max(1, (p >> 12) & 0xF), max(1, (p >> 16) & 0xF)
+                dh, dw = 1, 1
+            elif op in (4, 5, 7):
+                kh, kw, sh, sw, dh, dw = 1, 1, 1, 1, 1, 1
+            else:
+                kh, kw = m.get('kernel_h', 1), m.get('kernel_w', 1)
+                sh, sw = max(1, m.get('stride_h', 1)), max(1, m.get('stride_w', 1))
+                dh, dw = max(1, m.get('dilation_h', 1)), max(1, m.get('dilation_w', 1))
+            in_th = (th - 1) * sh + (kh - 1) * dh + 1
+            in_tw = (tw - 1) * sw + (kw - 1) * dw + 1
+            in_words = (in_th * in_tw * m['in_c'] * eb + 3) // 4
+            out_words = (th * tw * m['out_c'] * eb + 3) // 4
+            nt = max(1, m.get('tile_num_h', 1)) * max(1, m.get('tile_num_w', 1))
+            m['tile_in_size'] = in_words * 4
+            m['dma_in_size'] = in_words * 4 * nt
+            m['tile_out_size'] = out_words * 4
+            m['row_cfg'] = (th << 16) | ((tw * m['out_c'] * eb + 3) // 4)
+            m['store_mode'] = m.get('store_mode', 0) | 1
+            m['sched_ctrl'] |= (1 << 4)
+
+
+def apply_general_fusions(meta, data, model_name):
+    """Apply general cross-layer fusions (idempotent with converter output,
+    while upgrading legacy checked-in golden metadata automatically).
+    """
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, 'tools'))
+    from hw_config import HWConfig
+    from layer_fusion import (
+        apply_super_block_fusion,
+        apply_conv_pool_strip_fusion,
+        apply_untiled_sram_fusion,
+    )
+
+    profile = HWConfig(
+        act_bank_size=IFM_KB * 1024,
+        ofm_bank_size=OFM_KB * 1024,
+        weight_buf_size=WGT_KB * 1024,
+        param_sram_size=PARAM_KB * 1024,
+        param_sram_max_ch=(PARAM_KB * 1024) // 16,
+    )
+
+    # 1. Legacy L0 pre-sliced fuse_input.npy path (if present in golden dir)
+    enable_conv_pool_strip_fusion(meta, data)
+
+    # 2. General tiled INT8 Conv1x1 -> DW3x3 -> Conv1x1 super-blocks
+    # Preserve pre-tuned model_x square tiles if desired, else general search
+    super_marked = apply_super_block_fusion(meta, profile=profile)
+    if super_marked:
+        print(f"  {model_name} super-blocks: {super_marked}")
+
+    # 3. General NHWC Conv -> Pool strip fusion (protect L0 if its input .npy
+    # was pre-tiled without fuse_input.npy on a legacy golden)
+    saved_l0_sched = None
+    if meta and 'fuse_input' not in data[0]:
+        eb0 = 2 if meta[0].get('data_type', 0) else 1
+        full_l0_words = (meta[0]['in_h'] * meta[0]['in_w'] * meta[0]['in_c'] * eb0 + 3) // 4
+        if len(data[0]['input']) != full_l0_words:
+            # Temporarily mark L0 ineligible for direct NHWC slicing
+            saved_l0_sched = meta[0].get('sched_ctrl', 0)
+            meta[0]['sched_ctrl'] = (saved_l0_sched & ~0x20) | 0x80
+    strip_marked = apply_conv_pool_strip_fusion(
+        meta, profile=profile, stamp_firmware_fields=True)
+    if saved_l0_sched is not None:
+        meta[0]['sched_ctrl'] = saved_l0_sched & ~0x20
+    if strip_marked:
+        print(f"  {model_name} NHWC conv-pool strips: {strip_marked}")
+
+    # 4. General arbitrary-length untiled SRAM chain fusion
+    sram_chains = apply_untiled_sram_fusion(meta, profile=profile)
+    if sram_chains:
+        print(f"  {model_name} untiled SRAM chains: {sram_chains}")
 
 
 def remap_ddr(addr):
@@ -449,7 +528,21 @@ def prepare_row_weights(meta, data):
         if m.get('wgt_layout', 0) == WGT_LAYOUT_K_MAJOR:
             # Current converters already emit grouped K-major weights and
             # bin2golden supplies the matching reload stride. Repacking them
-            # as if they were legacy OC-major silently corrupts the blob.
+            # as if they were legacy OC-major silently corrupts the blob,
+            # though a partial tail OC group still needs reload-stride padding.
+            wpo = int(m.get('wgt_per_oc_words', 0))
+            if op != 1 and wpo and not (wpo & 0x80000000):
+                es = 2 if m.get('data_type', 0) == 1 else 1
+                kd_bytes = m['kernel_h'] * m['kernel_w'] * m['in_c'] * es
+                group_bytes = wpo * 4
+                if kd_bytes > 0 and group_bytes % kd_bytes == 0:
+                    group_ch = group_bytes // kd_bytes
+                    groups = (m['out_c'] + group_ch - 1) // group_ch
+                    need_words = (groups * group_bytes + 3) // 4
+                    if len(d['wgt']) < need_words:
+                        d['wgt'] = np.pad(
+                            d['wgt'], (0, need_words - len(d['wgt'])),
+                            mode='constant')
             continue
         es = 2 if m.get('data_type', 0) == 1 else 1
         dtype = np.int16 if es == 2 else np.int8
@@ -579,7 +672,10 @@ def build_chained_blob(meta, data, standalone_layer=-1):
         # RTL decodes W from [15:0] and H from [31:16].
         in_hw = m['in_w'] | (m['in_h'] << 16)
         out_hw = m['out_w'] | (m['out_h'] << 16)
-        kernel_dil = m['kernel_h'] | (m['kernel_w'] << 8)
+        dh = m.get('dilation_h', 1)
+        dw = m.get('dilation_w', 1)
+        kernel_dil = (m['kernel_h'] | (m['kernel_w'] << 8)
+                      | (0 if (dh == 1 and dw == 1) else ((dh << 16) | (dw << 24))))
         stride = m['stride_h'] | (m['stride_w'] << 8)
         padding = m.get('pad_top', 0) | (m.get('pad_left', 0) << 8)
 
@@ -808,7 +904,9 @@ def main():
     parser.add_argument('--standalone-layer', type=int, default=-1,
                         help='Also pack input data for this layer (for standalone testing)')
     parser.add_argument('--enable-super-block', action='store_true',
-                        help='Explicitly mark the strict Model A INT8 L52-L54 prototype')
+                        help='Compatibility flag (general super-block fusion is enabled by default)')
+    parser.add_argument('--no-fuse', action='store_true',
+                        help='Disable cross-layer fusions (run all layers independently)')
     args = parser.parse_args()
 
     if args.self_test:
@@ -819,15 +917,13 @@ def main():
     meta, data = load_model_golden(args.model)
     print(f"  {len(meta)} layers loaded")
     prepare_row_weights(meta, data)
+    if args.no_fuse or args.standalone_layer >= 0:
+        strip_pre_applied_fusions(meta, data)
     retile_oversize_untiled_adds(meta)
     if args.model.startswith('model_'):
         retile_for_double_buffer(meta, args.model)
-    if args.enable_super_block:
-        mark_model_x(meta, args.model)
-    if args.model.startswith('model_x_'):
-        enable_untiled_sram_fusion(meta, args.model)
-    if args.model in ('model_x', 'model_c_int8') and args.standalone_layer < 0:
-        enable_conv_pool_strip_fusion(meta, data)
+    if args.standalone_layer < 0 and not args.no_fuse:
+        apply_general_fusions(meta, data, args.model)
 
     # Check which layers have valid golden data
     valid = sum(1 for d in data if len(d['output']) > 0)
