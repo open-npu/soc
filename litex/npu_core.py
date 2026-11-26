@@ -82,8 +82,6 @@ class NPUCore(Module):
             "npu_sram.v",
             "npu_sram_wide.v",
             "npu_dma.v",
-            "npu_dw_conv.v",
-            "npu_dw_bank.v",
             "npu_ctrl.v",
             "npu_compute.v",
             "npu_top.v",
