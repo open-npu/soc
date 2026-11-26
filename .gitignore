@@ -7,6 +7,7 @@ firmware/*.elf
 firmware/*.bin
 firmware/*.dis
 sim/*.init
+sim/*.hex
 sim/*.log
 sim/obj_dir/
 sim/obj_*/

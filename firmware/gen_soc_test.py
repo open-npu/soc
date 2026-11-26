@@ -2,7 +2,7 @@
 """
 Generate SoC firmware test data for chained model inference.
 
-Reads golden .npy files and metadata.json for model_x/b/c/d INT16,
+Reads golden .npy files and metadata.json for coded models (e.g. model_c/e),
 produces:
   - test_data.bin     — binary blob with 37-word layer_entry_t headers
   - soc_test_data.h   — C header with blob format and model base address
@@ -11,8 +11,8 @@ Chained inference: Layer N output in DDR becomes Layer N+1 input.
 Only layer 0 has inline input data; all layers have golden output for verification.
 
 Usage:
-  python3 gen_soc_test.py --model model_x
-  python3 gen_soc_test.py --model model_x
+  python3 gen_soc_test.py --model model_e_int8
+  python3 gen_soc_test.py --model model_c_int16
 
 SPDX-License-Identifier: Apache-2.0
 """
@@ -413,7 +413,6 @@ def apply_general_fusions(meta, data, model_name):
     enable_conv_pool_strip_fusion(meta, data)
 
     # 2. General tiled INT8 Conv1x1 -> DW3x3 -> Conv1x1 super-blocks
-    # Preserve pre-tuned model_x square tiles if desired, else general search
     super_marked = apply_super_block_fusion(meta, profile=profile)
     if super_marked:
         print(f"  {model_name} super-blocks: {super_marked}")
@@ -612,8 +611,8 @@ def build_chained_blob(meta, data, standalone_layer=-1):
     """
     # ─── Re-allocate DDR regions non-overlapping ───
     # The packer (bin2golden.generate_golden + generator Add patching) can leave
-    # a layer's OUT region overlapping the NEXT layer's WGT region (e.g. model_x
-    # L12 Add out vs L13 Conv wgt, 128-word overlap → L13 loads corrupted weights).
+    # a layer's OUT region overlapping the NEXT layer's WGT region (e.g. an Add
+    # layer's out vs next Conv wgt overlap → next layer loads corrupted weights).
     # The metadata's relative spacing is only safe for standalone (single-layer)
     # use; chained inference needs each layer's regions to be disjoint because a
     # layer's runtime output DMA must not clobber another layer's weights/params.
@@ -898,7 +897,7 @@ def main():
         return value
 
     mode.add_argument('--model', type=model_name,
-                      help='Coded model, e.g. model_x')
+                      help='Coded model, e.g. model_e_int8')
     mode.add_argument('--self-test', action='store_true',
                       help='Validate the 37-word binary ABI and exit')
     parser.add_argument('--standalone-layer', type=int, default=-1,

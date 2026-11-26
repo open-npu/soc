@@ -3,7 +3,7 @@
 # Fails unless UART contains RESULT: PASS and no layer reports npu=0.
 set -euo pipefail
 
-MODEL="${1:?usage: $0 model_x}"
+MODEL="${1:?usage: $0 model_e_int8}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GEN="$ROOT/tools/internal/gen/${MODEL}_golden.py"
 LOG="$ROOT/soc/sim/sim_${MODEL}_accept.log"

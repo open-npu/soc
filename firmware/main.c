@@ -333,7 +333,7 @@ static int layer_db_ok(const uint32_t *e) {
  * Converter now stamps one large tile grid on each IR (1×1→DW→1×1 [+Add]).
  * Tiled same-grid still cannot skip DMA: compute finishes all tiles of
  * START before MID starts, so only the last tile would remain in SRAM.
- * Mixed tiled START + untiled MID (M_X L16→L17) falls back to DDR. A later
+ * Mixed tiled START + untiled MID falls back to DDR. A later
  * untiled FUSE_END can still reuse SRAM after that DDR-loaded MID. */
 static int sram_fuse_reuse(const uint32_t *prev, const uint32_t *cur,
                            uint32_t prev_idx) {
@@ -455,7 +455,7 @@ static void npu_program_layer(const uint32_t *e,
     /* OFM is a separate bank, so conv/depthwise/pool write at word 0.
      * The old offset (input tile size) placed the output after the
      * input in a shared SRAM. On a wide layer that offset plus the
-     * output tile no longer fits in the OFM half (model_x L60).
+     * output tile no longer fits in the OFM half.
      * Add keeps the offset: branch B is loaded after branch A in the IFM. */
     uint32_t out_base = 0;
     if (op_type == 4 || op_type == 7)
@@ -494,7 +494,7 @@ static void npu_program_layer(const uint32_t *e,
     /* STORE_MODE must be written unconditionally — in a chained run a stale
      * PTS_EN=1 from a previous tiled layer would otherwise divert a non-PTS
      * layer's final store to the S_TILE_STORE path with the wrong source
-     * address (hit by model_x L61 after L60: output read back as zeros). */
+     * address (output read back as zeros). */
     NPU_REG(REG_DMA_STORE_MODE)    = e[22];
     NPU_REG(REG_DMA_TILE_OUT_SIZE) = e[24];
     NPU_REG(REG_DMA_ROW_CFG)       = e[25];
@@ -1733,20 +1733,14 @@ void main(void) {
     }
 #else
     /* Run selected model (chained inference) */
-#if defined(RUN_model_x)
-    test_case_t tc = { BLOB_MODEL_BASE, "model_x (synth_dw INT16, 63 layers)" };
-#elif defined(RUN_model_x)
-    test_case_t tc = { BLOB_MODEL_BASE, "model_x (synth_res synth_data INT8, 25 layers)" };
-#elif defined(RUN_MODEL_C)
-    test_case_t tc = { BLOB_MODEL_BASE, "model_c (synth_ms INT16, 17 layers)" };
-#elif defined(RUN_model_x)
-    test_case_t tc = { BLOB_MODEL_BASE, "model_x (benchmark INT16, 24 layers)" };
-#elif defined(RUN_MODEL_E)
-    test_case_t tc = { BLOB_MODEL_BASE, "model_e (synth_res rgb_data INT16, 31 layers)" };
-#elif defined(RUN_MODEL_GENERIC)
+#if defined(RUN_MODEL_GENERIC)
     test_case_t tc = { BLOB_MODEL_BASE, MODEL_LABEL };
+#elif defined(RUN_MODEL_C)
+    test_case_t tc = { BLOB_MODEL_BASE, "model_c" };
+#elif defined(RUN_MODEL_E)
+    test_case_t tc = { BLOB_MODEL_BASE, "model_e" };
 #else
-    uart_puts("ERROR: No model selected. Compile with -DRUN_MODEL_X\n");
+    uart_puts("ERROR: No model selected. Compile with -DRUN_MODEL_GENERIC\n");
     while (1) {}
 #endif
 
