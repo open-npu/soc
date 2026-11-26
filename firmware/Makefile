@@ -31,7 +31,7 @@ SIM_DIR = ../sim
 
 all: $(TARGET).bin $(TARGET).hex $(MAIN_RAM_INIT)
 
-# Model selection (coded model name, e.g. model_c_int8 / model_e_int8).
+# Model selection (coded model name, e.g. model_c_int8 / model_e_int8 / model_s_int8).
 MODEL ?= model_e_int8
 STANDALONE_LAYER ?= -1
 SUPER_BLOCK ?= 1
@@ -66,6 +66,9 @@ DEFINES += -DRUN_MODEL_C
 endif
 ifeq ($(findstring model_e,$(MODEL)),model_e)
 DEFINES += -DRUN_MODEL_E
+endif
+ifeq ($(findstring model_s,$(MODEL)),model_s)
+DEFINES += -DRUN_MODEL_S
 endif
 
 # Generate both artifacts on every build. MODEL and STANDALONE_LAYER are make

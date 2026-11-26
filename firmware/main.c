@@ -1,7 +1,7 @@
 /*
  * Open-NPU SoC Firmware — Chained Model Inference Test Runner
  *
- * Runs INT16 model (a/b/c/d) with chained inference:
+ * Runs INT8/INT16 coded models (c/e/s) with chained inference:
  * Layer N output → Layer N+1 input (DDR). Supports tiling,
  * per-OC weight reload, fused blocks, skip-connections, Add/Concat.
  *
@@ -1739,6 +1739,8 @@ void main(void) {
     test_case_t tc = { BLOB_MODEL_BASE, "model_c" };
 #elif defined(RUN_MODEL_E)
     test_case_t tc = { BLOB_MODEL_BASE, "model_e" };
+#elif defined(RUN_MODEL_S)
+    test_case_t tc = { BLOB_MODEL_BASE, "model_s" };
 #else
     uart_puts("ERROR: No model selected. Compile with -DRUN_MODEL_GENERIC\n");
     while (1) {}

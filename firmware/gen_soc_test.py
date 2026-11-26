@@ -205,6 +205,8 @@ def retile_for_double_buffer(meta, model_name):
             continue
         if m.get('wgt_per_oc_words', 0) != 0 or (m.get('store_mode', 0) & 2):
             continue
+        if m.get('out_c', 0) > (PARAM_KB * 1024) // 16:
+            continue
         eb = 2 if m.get('data_type', 0) else 1
         need_bytes = m.get('tile_in_size', 0) * (2 if op == 4 else 1)
         limit_bytes = IFM_KB * 1024 if op == 4 else half_bytes
@@ -230,14 +232,17 @@ def retile_for_double_buffer(meta, model_name):
                 weight_buf_size=WGT_KB * 1024,
                 param_sram_size=PARAM_KB * 1024,
                 param_sram_max_ch=(PARAM_KB * 1024) // 16)
-        tile = compute_tiling(
-            op_type=op_names[op],
-            in_h=m['in_h'], in_w=m['in_w'], in_c=m['in_c'],
-            out_h=m['out_h'], out_w=m['out_w'], out_c=m['out_c'],
-            kernel_h=m['kernel_h'], kernel_w=m['kernel_w'],
-            stride_h=m['stride_h'], stride_w=m['stride_w'],
-            dilation_h=m.get('dilation_h', 1), dilation_w=m.get('dilation_w', 1),
-            elem_size=eb, double_buffer=use_db, profile=layer_profile)
+        try:
+            tile = compute_tiling(
+                op_type=op_names[op],
+                in_h=m['in_h'], in_w=m['in_w'], in_c=m['in_c'],
+                out_h=m['out_h'], out_w=m['out_w'], out_c=m['out_c'],
+                kernel_h=m['kernel_h'], kernel_w=m['kernel_w'],
+                stride_h=m['stride_h'], stride_w=m['stride_w'],
+                dilation_h=m.get('dilation_h', 1), dilation_w=m.get('dilation_w', 1),
+                elem_size=eb, double_buffer=use_db, profile=layer_profile)
+        except ValueError:
+            continue
         th, tw = tile['tile_h'], tile['tile_w']
         dh = max(1, m.get('dilation_h', 1))
         dw = max(1, m.get('dilation_w', 1))
