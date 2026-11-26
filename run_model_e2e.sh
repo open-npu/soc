@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
-# Fresh CSIM golden → firmware → SoC RTL. Never reuse leftover npy/blob.
+# Build firmware from CSIM golden → run SoC Verilator bit-exact check.
 # Fails unless UART contains RESULT: PASS and no layer reports npu=0.
 set -euo pipefail
 
 MODEL="${1:?usage: $0 model_e_int8}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GEN="$ROOT/tools/internal/gen/${MODEL}_golden.py"
+GOLDEN_DIR="$ROOT/rtl/tb/golden/golden_dma_e2e/${MODEL}"
 LOG="$ROOT/soc/sim/sim_${MODEL}_accept.log"
 
-if [[ ! -f "$GEN" ]]; then
-  echo "ERROR: missing $GEN" >&2
+if [[ -f "$GEN" ]]; then
+  echo "=== 0/4 wipe cached converter/golden for $MODEL ==="
+  rm -rf "/tmp/${MODEL}_golden"
+  rm -rf "$GOLDEN_DIR"
+
+  echo "=== 1/4 convert + CSIM dump → $MODEL golden ==="
+  python3 "$GEN"
+elif [[ -f "$GOLDEN_DIR/metadata.json" ]]; then
+  echo "=== 1/4 using pre-generated CSIM golden at $GOLDEN_DIR ==="
+else
+  echo "ERROR: missing golden directory $GOLDEN_DIR" >&2
   exit 2
 fi
-
-echo "=== 0/4 wipe cached converter/golden for $MODEL ==="
-rm -rf "/tmp/${MODEL}_golden"
-rm -rf "$ROOT/rtl/tb/golden/golden_dma_e2e/${MODEL}"
-
-echo "=== 1/4 convert + CSIM dump → $MODEL golden ==="
-python3 "$GEN"
 
 echo "=== 2/4 pack firmware from that golden ==="
 cd "$ROOT/soc/firmware"
