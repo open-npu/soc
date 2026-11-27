@@ -147,6 +147,44 @@ def enable_conv_pool_strip_fusion(meta, data):
     return True
 
 
+def untile_sram_resident_layers(meta, standalone_layer=-1):
+    """Untile Conv layers whose full input and output tensors fit IFM/OFM SRAM.
+
+    Checked-in legacy metadata spatially tiled layers whenever weights exceeded
+    80 KB even if the full activation tensors fit in SRAM (e.g. 7x7x512 = 24.5 KB
+    <= 32 KB IFM). Keeping them untiled eliminates redundant spatial input reloads
+    and lets weight ping-pong stream OC groups at 100% MAC efficiency.
+    """
+    changed = []
+    ifm_bytes = IFM_KB * 1024
+    ofm_bytes = OFM_KB * 1024
+    for i, m in enumerate(meta):
+        if i == 0 or i == standalone_layer or m.get('op_type') != 0:
+            continue
+        if m.get('tile_h', 0) == 0 or (m.get('sched_ctrl', 0) & 0xAE):
+            continue
+        eb = 2 if m.get('data_type', 0) else 1
+        full_in = m['in_h'] * m['in_w'] * m['in_c'] * eb
+        full_out = m['out_h'] * m['out_w'] * m['out_c'] * eb
+        if full_in <= ifm_bytes and full_out <= ofm_bytes:
+            old = (m['tile_h'], m['tile_w'])
+            m['tile_h'] = 0
+            m['tile_w'] = 0
+            m['tile_num_h'] = 0
+            m['tile_num_w'] = 0
+            m['tile_in_size'] = 0
+            m['tile_out_size'] = 0
+            m['dma_in_size'] = ((full_in + 3) // 4) * 4
+            m['dma_out_size'] = ((full_out + 3) // 4) * 4
+            m['row_cfg'] = 0
+            m['store_mode'] = 0
+            m['sched_ctrl'] = m.get('sched_ctrl', 0) & ~0x11
+            changed.append((i, old))
+    if changed:
+        print(f"  Untiled SRAM-resident Conv layers: {changed}")
+    return changed
+
+
 def retile_oversize_untiled_adds(meta):
     """Split untiled Add tensors whose two inputs cannot coexist in IFM."""
     changed = []
@@ -193,9 +231,19 @@ def retile_for_double_buffer(meta, model_name):
                 4: 'add', 5: 'resize', 6: 'deconv', 7: 'concat'}
     half_bytes = (IFM_DEPTH_WORDS // 2) * 4
     super_member = set()
-    for idx_s, ms in enumerate(meta):
-        if ms.get('sched_ctrl', 0) & (1 << 7):
-            super_member.update((idx_s, idx_s + 1, idx_s + 2))
+    idx_s = 0
+    while idx_s < len(meta):
+        if meta[idx_s].get('op_type') == 0 and (meta[idx_s].get('sched_ctrl', 0) & (1 << 7)):
+            if (idx_s + 3 < len(meta)
+                    and meta[idx_s + 3].get('op_type') == 4
+                    and (meta[idx_s + 3].get('sched_ctrl', 0) & (1 << 7))):
+                super_member.update((idx_s, idx_s + 1, idx_s + 2, idx_s + 3))
+                idx_s += 4
+            else:
+                super_member.update((idx_s, idx_s + 1, idx_s + 2))
+                idx_s += 3
+        else:
+            idx_s += 1
     changed = []
     for i, m in enumerate(meta):
         if i == 0 or i in super_member or m.get('tile_h', 0) == 0:
@@ -478,12 +526,40 @@ def _bytes_to_words(blob):
     return np.frombuffer(blob, dtype=np.uint32).copy()
 
 
-def _row_group_channels(k_depth, elem_bytes):
-    """Widest power-of-two OC group whose full K vector fits WGT SRAM."""
+def _row_group_channels(k_depth, elem_bytes, cap_bytes=None):
+    """Widest power-of-two OC group whose full K vector fits cap_bytes."""
+    if cap_bytes is None:
+        cap_bytes = WGT_SRAM_BYTES
     for channels in (64, 32, 16, 8, 4, 2, 1):
-        if channels * k_depth * elem_bytes <= WGT_SRAM_BYTES:
+        if channels * k_depth * elem_bytes <= cap_bytes:
             return channels
     return 0
+
+
+def _try_half_wgt_pingpong(m, k_depth, es, cur_group_ch):
+    """Return narrower OC group <= 40 KB when spatial pixels sustain 64-lane MACs.
+
+    Never shrink group_ch on multi-tile group-major layers (store_mode & 2 and
+    num_tiles > 1), where OC groups are the outer loop: halving group_ch there
+    would double the number of full-feature-map input tile reloads from DDR.
+    """
+    if m.get('op_type') != 0:
+        return 0
+    ntiles = max(1, m.get('tile_num_h', 1)) * max(1, m.get('tile_num_w', 1))
+    if m.get('tile_h', 0) > 0 and (m.get('store_mode', 0) & 2) and ntiles > 1:
+        return 0
+    half_cap = WGT_SRAM_BYTES // 2
+    half_ch = _row_group_channels(k_depth, es, cap_bytes=half_cap)
+    if half_ch <= 0 or half_ch >= cur_group_ch or half_ch >= m['out_c']:
+        return 0
+    th, tw = m.get('tile_h', 0), m.get('tile_w', 0)
+    min_tpx = (th * tw) if th > 0 else (m['out_h'] * m['out_w'])
+    lanes_goal = (ROW_LANES // 2) if es == 2 else ROW_LANES
+    if min_tpx * half_ch < lanes_goal:
+        return 0
+    if (m.get('store_mode', 0) & 2) and ((half_ch * es) % 4 != 0):
+        return 0
+    return half_ch
 
 
 def prepare_row_weights(meta, data):
@@ -537,16 +613,39 @@ def prepare_row_weights(meta, data):
             wpo = int(m.get('wgt_per_oc_words', 0))
             if op != 1 and wpo and not (wpo & 0x80000000):
                 es = 2 if m.get('data_type', 0) == 1 else 1
-                kd_bytes = m['kernel_h'] * m['kernel_w'] * m['in_c'] * es
-                group_bytes = wpo * 4
+                dtype = np.int16 if es == 2 else np.int8
+                kh, kw, ic, oc = m['kernel_h'], m['kernel_w'], m['in_c'], m['out_c']
+                k_depth = kh * kw * ic
+                kd_bytes = k_depth * es
+                wpo_words = wpo & 0x3FFFFFFF
+                group_bytes = wpo_words * 4
                 if kd_bytes > 0 and group_bytes % kd_bytes == 0:
                     group_ch = group_bytes // kd_bytes
-                    groups = (m['out_c'] + group_ch - 1) // group_ch
-                    need_words = (groups * group_bytes + 3) // 4
-                    if len(d['wgt']) < need_words:
-                        d['wgt'] = np.pad(
-                            d['wgt'], (0, need_words - len(d['wgt'])),
-                            mode='constant')
+                    half_ch = (0 if (wpo & 0x40000000)
+                               else _try_half_wgt_pingpong(m, k_depth, es, group_ch))
+                    if half_ch > 0:
+                        raw = _words_to_bytes(d['wgt'])
+                        expect = oc * kd_bytes
+                        weights = conv_weights_from_blob(
+                            raw[:expect], WGT_LAYOUT_K_MAJOR,
+                            oc, kh, kw, ic, dtype, lanes=group_ch)
+                        blob = conv_weights_to_blob(
+                            weights, WGT_LAYOUT_K_MAJOR, lanes=half_ch)
+                        half_grp_bytes = half_ch * kd_bytes
+                        groups = (oc + half_ch - 1) // half_ch
+                        padded = groups * half_grp_bytes
+                        packed = blob + bytes(padded - len(blob))
+                        d['wgt'] = _bytes_to_words(packed)
+                        m['wgt_per_oc_words'] = (half_grp_bytes // 4) | 0x40000000
+                        print(f"  L{i} WGT ping-pong repack: grp {group_ch}->{half_ch} "
+                              f"({half_grp_bytes // 4}w/grp)")
+                    else:
+                        groups = (oc + group_ch - 1) // group_ch
+                        need_words = (groups * group_bytes + 3) // 4
+                        if len(d['wgt']) < need_words:
+                            d['wgt'] = np.pad(
+                                d['wgt'], (0, need_words - len(d['wgt'])),
+                                mode='constant')
             continue
         es = 2 if m.get('data_type', 0) == 1 else 1
         dtype = np.int16 if es == 2 else np.int8
@@ -568,8 +667,11 @@ def prepare_row_weights(meta, data):
             # sized K slices instead. Bit 31 marks this interpretation of wpo.
             kslice = (len(raw) > WGT_SRAM_BYTES
                       and m.get('tile_h', 0) * m.get('tile_w', 0) <= 1
+                      and m.get('tile_h', 0) > 0
                       and auto_group_ch < ROW_LANES)
-            group_ch = ROW_LANES if kslice else auto_group_ch
+            half_ch = (0 if (len(raw) <= WGT_SRAM_BYTES or kslice)
+                       else _try_half_wgt_pingpong(m, k_depth, es, auto_group_ch))
+            group_ch = ROW_LANES if kslice else (half_ch if half_ch > 0 else auto_group_ch)
             weights = conv_weights_from_blob(
                 raw, WGT_LAYOUT_OC_MAJOR, oc, kh, kw, ic, dtype)
             blob = conv_weights_to_blob(
@@ -599,6 +701,8 @@ def prepare_row_weights(meta, data):
             wpo = group_bytes // 4
             if op != 1 and kslice:
                 wpo |= 0x80000000
+            elif op == 0 and half_ch > 0:
+                wpo |= 0x40000000
         d['wgt'] = _bytes_to_words(packed)
         m['wgt_layout'] = 1
         m['wgt_per_oc_words'] = wpo
@@ -920,9 +1024,10 @@ def main():
     print(f"Loading golden data for {args.model}...")
     meta, data = load_model_golden(args.model)
     print(f"  {len(meta)} layers loaded")
-    prepare_row_weights(meta, data)
     if args.no_fuse or args.standalone_layer >= 0:
         strip_pre_applied_fusions(meta, data)
+    untile_sram_resident_layers(meta, args.standalone_layer)
+    prepare_row_weights(meta, data)
     retile_oversize_untiled_adds(meta)
     if args.model.startswith('model_'):
         retile_for_double_buffer(meta, args.model)

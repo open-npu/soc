@@ -287,9 +287,7 @@ static int layer_db_ok(const uint32_t *e) {
         return 0;
     if (e[21] & SCHED_NO_AUTO_DB)
         return 0;
-    /* Group-major traversal and DB_EN are mutually exclusive in the RTL. */
-    if ((e[22] & 0x3u) == 0x3u)
-        return 0;
+    /* Group-major layers also require aligned channel-slice bytes for DB_EN. */
     /* Concat scatters into an offset output region and later phases preload
      * that region. Its bank lifetime is not compatible with the current
      * background DB scheduler; keep the proven single-buffer path. */
@@ -536,6 +534,9 @@ static void copy_layer_entry(uint32_t *dst, const uint32_t *src) {
 static void program_super_slot(uint32_t slot, const uint32_t *e,
                                uint32_t runtime_in_addr,
                                uint32_t runtime_out_addr,
+                               uint32_t runtime_res_addr,
+                               uint32_t out_base_words,
+                               uint32_t super_ctrl_flags,
                                uint32_t wgt_base, uint32_t param_base,
                                uint32_t tile_h, uint32_t tile_w,
                                uint32_t tiles_h, uint32_t tiles_w) {
@@ -550,13 +551,14 @@ static void program_super_slot(uint32_t slot, const uint32_t *e,
     if ((e[4] & 0xFu) == 3u) d[8] = e[18];
     d[12] = tile_h | (tile_w << 16);
     d[13] = tiles_h | (tiles_w << 16);
-    d[14] = 0;
+    d[14] = (out_base_words & 0xFFFFu) << 16;
     d[15] = runtime_in_addr;
     d[16] = runtime_out_addr;
     d[17] = e[29];
     d[18] = e[30];
     d[19] = slot == 0 ? (e[6] & 0xFFFFu) * e[7] : 0u;
     d[21] = 0;       /* no DB_EN/fusion flags */
+    d[22] = runtime_res_addr;
     d[24] = e[15];   d[25] = e[16]; d[26] = e[17];
     d[27] = e[23];   d[28] = e[24];
     d[29] = 0;       /* controller owns final PTS store */
@@ -566,13 +568,15 @@ static void program_super_slot(uint32_t slot, const uint32_t *e,
     d[42] = wgt_base;
     d[43] = param_base;
 
-    NPU_REG(REG_SUPER_CTRL) = (slot & 3u) << 8;
+    NPU_REG(REG_SUPER_CTRL) = ((slot & 3u) << 8) | super_ctrl_flags;
     for (uint32_t i = 0; i < 44; i++)
         NPU_REG(REG_SUPER_DESC_BASE + i * 4u) = d[i];
 }
 
 static int run_super_block(const uint32_t *a, const uint32_t *dw,
-                           const uint32_t *pw, uint32_t runtime_in_addr) {
+                           const uint32_t *pw, const uint32_t *add_e,
+                           uint32_t runtime_in_addr,
+                           uint32_t runtime_res_addr) {
     uint32_t h = a[6] >> 16;
     uint32_t w = a[6] & 0xFFFFu;
     uint32_t in_c = a[7], mid_c = a[9], out_c = pw[9];
@@ -580,7 +584,8 @@ static int run_super_block(const uint32_t *a, const uint32_t *dw,
     uint32_t tile_w = a[19] >> 16;
     uint32_t tiles_h = a[20] & 0xFFFFu;
     uint32_t tiles_w = a[20] >> 16;
-    uint32_t wgt0, wgt1, wgt2, param0, param1, param2;
+    uint32_t wgt0, wgt1, wgt2, param0, param1, param2, param3;
+    uint32_t total_param_words, super_ctrl_flags = 0u, res_buf_words = 0u;
     if ((a[4] & 0xFu) != 0u || (dw[4] & 0xFu) != 1u
             || (pw[4] & 0xFu) != 0u
             || a[5] != 0 || dw[5] != 0 || pw[5] != 0
@@ -600,6 +605,15 @@ static int run_super_block(const uint32_t *a, const uint32_t *dw,
             || pw[6] != a[8] || pw[8] != a[8]
             || pw[7] != mid_c)
         return -13;
+    if (add_e) {
+        if ((add_e[4] & 0xFu) != 4u || add_e[5] != 0u
+                || add_e[6] != a[8] || add_e[8] != a[8]
+                || add_e[7] != out_c || add_e[9] != out_c
+                || runtime_res_addr == 0u)
+            return -13;
+        super_ctrl_flags |= (1u << 3);
+        res_buf_words = (tile_h * tile_w * out_c + 3u) >> 2;
+    }
 
     NPU_REG(REG_CTRL) = CTRL_SOFT_RST;
     for (volatile int d = 0; d < 100; d++) {}
@@ -608,19 +622,35 @@ static int run_super_block(const uint32_t *a, const uint32_t *dw,
     wgt0 = 0;
     wgt1 = wgt0 + ((a[16] + 3u) >> 2);
     wgt2 = wgt1 + ((dw[16] + 3u) >> 2);
-    param0 = 0;
-    param1 = param0 + a[14] * 4u;
-    param2 = param1 + dw[14] * 4u;
+    total_param_words = a[14] * 4u + dw[14] * 4u + pw[14] * 4u
+                      + (add_e ? add_e[14] : 0u);
+    if (total_param_words > 3072u) {
+        super_ctrl_flags |= (1u << 4);
+        param0 = 0u;
+        param1 = 0u;
+        param2 = 0u;
+        param3 = 0u;
+    } else {
+        param0 = 0u;
+        param1 = param0 + a[14] * 4u;
+        param2 = param1 + dw[14] * 4u;
+        param3 = param2 + pw[14] * 4u;
+    }
 
-    program_super_slot(0, a, runtime_in_addr, 0, wgt0, param0,
-                       tile_h, tile_w, tiles_h, tiles_w);
-    program_super_slot(1, dw, 0, 0, wgt1, param1,
-                       tile_h, tile_w, tiles_h, tiles_w);
-    program_super_slot(2, pw, 0, pw[31], wgt2, param2,
-                       tile_h, tile_w, tiles_h, tiles_w);
+    program_super_slot(0, a, runtime_in_addr, 0, 0, 0, super_ctrl_flags,
+                       wgt0, param0, tile_h, tile_w, tiles_h, tiles_w);
+    program_super_slot(1, dw, 0, 0, 0, 0, super_ctrl_flags,
+                       wgt1, param1, tile_h, tile_w, tiles_h, tiles_w);
+    program_super_slot(2, pw, 0, add_e ? 0u : pw[31], 0, 0, super_ctrl_flags,
+                       wgt2, param2, tile_h, tile_w, tiles_h, tiles_w);
+    if (add_e) {
+        program_super_slot(3, add_e, 0, add_e[31], runtime_res_addr,
+                           res_buf_words, super_ctrl_flags,
+                           wgt2, param3, tile_h, tile_w, tiles_h, tiles_w);
+    }
 
     NPU_REG(REG_IRQ_STATUS) = 0x7;
-    NPU_REG(REG_SUPER_CTRL) = 1u; /* request, START slot 0 */
+    NPU_REG(REG_SUPER_CTRL) = 1u | super_ctrl_flags; /* request, START slot 0 */
     dcache_flush();
     NPU_REG(REG_CTRL) = CTRL_START;
     dcache_flush();
@@ -1023,18 +1053,32 @@ static int run_chained_model(test_case_t *tc) {
         const uint32_t *prev = (l > 0) ? layer_e[l - 1] : 0;
         const uint32_t *next = (l + 1 < num_layers) ? layer_e[l + 1] : 0;
 
-        if ((e[21] & SCHED_SUPER_BLOCK) && l + 2 < num_layers) {
+        if (((e[4] & 0xFu) == 0u) && (e[21] & SCHED_SUPER_BLOCK) && l + 2 < num_layers) {
             const uint32_t *dw_cursor =
                 cursor + LAYER_ENTRY_HDR_WORDS + e[0] + e[1] + e[2] + e[3];
             const uint32_t *pw_cursor =
                 dw_cursor + LAYER_ENTRY_HDR_WORDS
                 + dw_cursor[0] + dw_cursor[1] + dw_cursor[2] + dw_cursor[3];
+            const uint32_t *after_pw =
+                pw_cursor + LAYER_ENTRY_HDR_WORDS
+                + pw_cursor[0] + pw_cursor[1] + pw_cursor[2] + pw_cursor[3];
+            int has_add = (l + 3 < num_layers)
+                       && ((after_pw[4] & 0xFu) == 4u)
+                       && ((after_pw[21] & SCHED_SUPER_BLOCK) != 0u);
+            const uint32_t *add_cursor = has_add ? after_pw : 0;
+            const uint32_t *final_cursor = has_add ? add_cursor : pw_cursor;
             int32_t in_src = (int32_t)e[34];
             uint32_t runtime_in_addr = (l == 0) ? e[32]
                 : ((in_src >= 0 && in_src < (int32_t)num_layers)
                    ? layer_out_addr[in_src] : layer_out_addr[l - 1]);
-            int ret = run_super_block(e, dw_cursor, pw_cursor,
-                                      runtime_in_addr);
+            uint32_t runtime_res_addr = 0u;
+            if (has_add) {
+                int32_t res_src = (int32_t)add_cursor[35];
+                if (res_src >= 0 && res_src < (int32_t)num_layers)
+                    runtime_res_addr = layer_out_addr[res_src];
+            }
+            int ret = run_super_block(e, dw_cursor, pw_cursor, add_cursor,
+                                      runtime_in_addr, runtime_res_addr);
             if (ret != 0) {
                 uart_puts("  SUPER ERROR at L");
                 uart_put_dec(l);
@@ -1050,23 +1094,23 @@ static int run_chained_model(test_case_t *tc) {
             prev_kept_in_sram = 0;
 #ifdef PERF_ONLY
 #ifdef PERF_HIST
-            /* One HW transaction represents three logical model layers.
-             * Keep two explicit placeholders and attribute the aggregate
-             * counters to the final PW layer so all later STL indices align. */
+            /* One HW transaction represents 3 or 4 logical model layers. */
             perf_hist_push(0);
             perf_hist_push(0);
+            if (has_add)
+                perf_hist_push(0);
             perf_hist_push(1);
 #endif
 #endif
 #ifndef PERF_ONLY
             dcache_flush();
             {
-                uint32_t n_output = pw_cursor[3];
+                uint32_t n_output = final_cursor[3];
                 const uint32_t *golden =
-                    pw_cursor + LAYER_ENTRY_HDR_WORDS
-                    + pw_cursor[0] + pw_cursor[1] + pw_cursor[2];
+                    final_cursor + LAYER_ENTRY_HDR_WORDS
+                    + final_cursor[0] + final_cursor[1] + final_cursor[2];
                 volatile const uint32_t *out_ptr =
-                    (volatile const uint32_t *)(uintptr_t)pw_cursor[31];
+                    (volatile const uint32_t *)(uintptr_t)final_cursor[31];
                 uint32_t mismatches = 0;
                 for (uint32_t i = 0; i < n_output; i++) {
                     if (out_ptr[i] != golden[i]) {
@@ -1093,16 +1137,17 @@ static int run_chained_model(test_case_t *tc) {
                     uart_puts("  SUPER PASS L");
                     uart_put_dec(l);
                     uart_puts("-L");
-                    uart_put_dec(l + 2);
+                    uart_put_dec(l + (has_add ? 3u : 2u));
                     uart_puts(" (");
                     uart_put_dec(n_output);
                     uart_puts(" words)\n");
                 }
             }
 #endif
-            cursor = pw_cursor + LAYER_ENTRY_HDR_WORDS
-                   + pw_cursor[0] + pw_cursor[1] + pw_cursor[2] + pw_cursor[3];
-            l += 2;
+            cursor = final_cursor + LAYER_ENTRY_HDR_WORDS
+                   + final_cursor[0] + final_cursor[1]
+                   + final_cursor[2] + final_cursor[3];
+            l += has_add ? 3u : 2u;
             continue;
         }
 
