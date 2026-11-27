@@ -14,13 +14,20 @@ NPU_INC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../rtl
 
 
 class NPUCore(Module):
-    def __init__(self, platform):
+    def __init__(self, platform, dma_bus_width=32):
+        if dma_bus_width not in (32, 64, 128):
+            raise ValueError(f"Unsupported dma_bus_width={dma_bus_width}; must be 32, 64, or 128")
+        word_shift = {32: 2, 64: 3, 128: 4}[dma_bus_width]
+
         # --- Wishbone Slave (CPU -> NPU CSR, 12-bit byte addr = 4KB) ---
         # LiteX WB adr is word-addressed; NPU uses 12-bit byte address
         self.wb_slave = wb_slv = wishbone.Interface(data_width=32, adr_width=30)
 
-        # --- Wishbone Master (NPU DMA -> main memory) ---
-        self.wb_master = wb_mst = wishbone.Interface(data_width=32, adr_width=30)
+        # --- Wishbone Master (NPU DMA -> main memory, parameterized 32/64/128-bit) ---
+        self.wb_master = wb_mst = wishbone.Interface(
+            data_width=dma_bus_width,
+            adr_width=32 - word_shift,
+        )
 
         # --- IRQ via EventManager ---
         self.submodules.ev = EventManager()
@@ -38,13 +45,14 @@ class NPUCore(Module):
         self.comb += npu_slv_adr[2:12].eq(wb_slv.adr[:10])
         # bits [1:0] are always 0 (word-aligned)
 
-        # NPU master: NPU outputs 32-bit byte addr, LiteX expects 30-bit word addr
-        # byte_addr[31:2] -> word_addr[29:0]
+        # NPU master: NPU outputs 32-bit byte addr aligned to (dma_bus_width/8) bytes;
+        # LiteX expects word-addressed adr = byte_addr >> word_shift.
         npu_mst_adr_byte = Signal(32)
-        self.comb += wb_mst.adr.eq(npu_mst_adr_byte[2:])
+        self.comb += wb_mst.adr.eq(npu_mst_adr_byte[word_shift:])
 
         # --- Instantiate npu_top ---
         self.specials += Instance("npu_top",
+            p_DMA_DATA_W = dma_bus_width,
             # Clock & Reset
             i_clk     = ClockSignal(),
             i_rst_n   = ~ResetSignal(),
@@ -82,6 +90,7 @@ class NPUCore(Module):
             "npu_sram.v",
             "npu_sram_wide.v",
             "npu_dma.v",
+            "npu_wb_to_axi4.v",
             "npu_ctrl.v",
             "npu_compute.v",
             "npu_top.v",

@@ -4,10 +4,11 @@
 set -euo pipefail
 
 MODEL="${1:?usage: $0 model_e_int8}"
+DMA_BUS_WIDTH="${DMA_BUS_WIDTH:-32}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GEN="$ROOT/tools/internal/gen/${MODEL}_golden.py"
 GOLDEN_DIR="$ROOT/rtl/tb/golden/golden_dma_e2e/${MODEL}"
-LOG="$ROOT/soc/sim/sim_${MODEL}_accept.log"
+LOG="$ROOT/soc/sim/sim_${MODEL}_w${DMA_BUS_WIDTH}_accept.log"
 
 if [[ -f "$GEN" ]]; then
   echo "=== 0/4 wipe cached converter/golden for $MODEL ==="
@@ -23,14 +24,14 @@ else
   exit 2
 fi
 
-echo "=== 2/4 pack firmware from that golden ==="
+echo "=== 2/4 pack firmware from that golden (DMA_BUS_WIDTH=$DMA_BUS_WIDTH) ==="
 cd "$ROOT/soc/firmware"
 make clean
-make MODEL="$MODEL"
+make MODEL="$MODEL" DMA_BUS_WIDTH="$DMA_BUS_WIDTH"
 
-echo "=== 3/4 SoC Verilator vs this CSIM ==="
+echo "=== 3/4 SoC Verilator vs this CSIM (DMA_BUS_WIDTH=$DMA_BUS_WIDTH) ==="
 cd "$ROOT/soc/sim"
-make run 2>&1 | tee "$LOG"
+make run DMA_BUS_WIDTH="$DMA_BUS_WIDTH" 2>&1 | tee "$LOG"
 
 echo "=== 4/4 require RESULT: PASS and npu>0 ==="
 if grep -q "RESULT: FAIL" "$LOG"; then

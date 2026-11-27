@@ -1,13 +1,18 @@
 # Verilator simulation Makefile for Open-NPU SoC
 
 VERILOG_TOP = sim
+DMA_BUS_WIDTH ?= 32
+ifeq ($(DMA_BUS_WIDTH),32)
 BUILD_DIR   = ../litex/build/npu_soc
+OBJ_DIR     = obj_dir
+else
+BUILD_DIR   = ../litex/build/npu_soc_w$(DMA_BUS_WIDTH)
+OBJ_DIR     = obj_dir_w$(DMA_BUS_WIDTH)
+endif
 GATEWARE    = $(BUILD_DIR)/gateware/$(VERILOG_TOP).v
 NPU_RTL_DIR = ../../rtl/src
 NPU_INC_DIR = ../../rtl/include
 VEXRISCV    = $(shell python3 -c "import pythondata_cpu_vexriscv; import os; print(os.path.join(os.path.dirname(pythondata_cpu_vexriscv.__file__), 'verilog', 'VexRiscv.v'))")
-
-OBJ_DIR     = obj_dir
 
 # NPU RTL sources
 NPU_SRCS = $(NPU_RTL_DIR)/npu_ppu.v \
@@ -16,6 +21,7 @@ NPU_SRCS = $(NPU_RTL_DIR)/npu_ppu.v \
            $(NPU_RTL_DIR)/npu_sram.v \
            $(NPU_RTL_DIR)/npu_sram_wide.v \
            $(NPU_RTL_DIR)/npu_dma.v \
+           $(NPU_RTL_DIR)/npu_wb_to_axi4.v \
            $(NPU_RTL_DIR)/npu_ctrl.v \
            $(NPU_RTL_DIR)/npu_compute.v \
            $(NPU_RTL_DIR)/npu_top.v
@@ -38,6 +44,7 @@ VERILATOR_FLAGS += +define+IFM_KB=$(IFM_KB)
 VERILATOR_FLAGS += +define+OFM_KB=$(OFM_KB)
 VERILATOR_FLAGS += +define+WGT_KB=$(WGT_KB)
 VERILATOR_FLAGS += +define+PARAM_KB=$(PARAM_KB)
+VERILATOR_FLAGS += +define+DMA_BUS_WIDTH=$(DMA_BUS_WIDTH)
 
 # Debug defines (enabled when DEBUG=1)
 ifeq ($(DEBUG),1)
@@ -56,8 +63,8 @@ all: run
 # Step 1: Generate SoC Verilog (if not already done)
 generate:
 	@if [ ! -f $(GATEWARE) ]; then \
-		echo "Generating SoC Verilog..."; \
-		cd ../litex && python3 npu_soc.py --build --output-dir $(abspath $(BUILD_DIR)); \
+		echo "Generating SoC Verilog (DMA_BUS_WIDTH=$(DMA_BUS_WIDTH))..."; \
+		cd ../litex && python3 npu_soc.py --build --dma-bus-width $(DMA_BUS_WIDTH) --output-dir $(abspath $(BUILD_DIR)); \
 	fi
 
 # Step 2: Verilate and compile

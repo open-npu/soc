@@ -137,6 +137,8 @@
 #endif
 #define HW_CFG_ARRAY_SIZE(v) ((v) & 0xFFu)
 #define HW_CFG_SPAD_KB(v)    (((v) >> 16) & 0xFFu)
+#define HW_CFG_DMA_WIDTH(v)  (32u << (((v) >> 27) & 0x3u))
+#define HW_CFG_DMA_AXI4(v)   (((v) >> 29) & 0x1u)
 #define NPU_SPAD_KB_DEFAULT  172u
 #define NPU_IFM_KB           32u
 #define NPU_OFM_KB           48u
@@ -1652,9 +1654,11 @@ void main(void) {
     uart_put_dec(HW_CFG_ARRAY_SIZE(hwcfg));
     uart_puts(", SPAD ");
     uart_put_dec(g_spad_kb);
-    uart_puts("KB, Act SRAM ");
-    uart_put_dec(g_act_words);
-    uart_puts(" words, HW config: 0x");
+    uart_puts("KB, DMA ");
+    uart_put_dec(HW_CFG_DMA_WIDTH(hwcfg));
+    uart_puts("b ");
+    uart_puts(HW_CFG_DMA_AXI4(hwcfg) ? "AXI4" : "WB");
+    uart_puts(", HW config: 0x");
     uart_put_hex32(hwcfg);
     uart_putc('\n');
 

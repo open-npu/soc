@@ -166,7 +166,42 @@ def self_test():
                 f'self-test: blob golden[{i}]=0x{got if got is not None else 0:08X} '
                 f'want 0x{g:08X}'
             )
-    print('build_main_ram self-test: PASS (workspace poison, blob golden intact)')
+
+    # Also verify 64-bit and 128-bit packing preserves little-endian lane order.
+    for bus_w in (64, 128):
+        bw = bus_w // 32
+        with tempfile.TemporaryDirectory() as tmp:
+            fw = os.path.join(tmp, 'fw.bin')
+            td = os.path.join(tmp, 'td.bin')
+            init_w = os.path.join(tmp, f'ram_{bus_w}.init')
+            with open(fw, 'wb') as f:
+                f.write(b'\x00\x00\x00\x00')
+            with open(td, 'wb') as f:
+                f.write(words_to_bytes(blob))
+            rc = os.system(
+                f'NPU_DMA_BUS_WIDTH={bus_w} {sys.executable} '
+                f'{os.path.abspath(__file__)} {fw} {td} {init_w}'
+            )
+            if rc:
+                raise SystemExit(f'self-test ({bus_w}b): build_main_ram failed rc={rc}')
+            wram = parse_init(init_w)
+        for i, g in enumerate(golden):
+            wa = (golden_off + i) // bw
+            lane = (golden_off + i) % bw
+            got = ((wram.get(wa, 0) >> (32 * lane)) & 0xFFFFFFFF)
+            if got != g:
+                raise SystemExit(
+                    f'self-test ({bus_w}b): golden[{i}]=0x{got:08X} want 0x{g:08X}'
+                )
+        for i in range(len(golden)):
+            wa = (out_base + i) // bw
+            lane = (out_base + i) % bw
+            got = ((wram.get(wa, 0) >> (32 * lane)) & 0xFFFFFFFF)
+            if got != OUT_POISON:
+                raise SystemExit(
+                    f'self-test ({bus_w}b): out[{i}]=0x{got:08X} want poison'
+                )
+    print('build_main_ram self-test: PASS (32/64/128b workspace poison, blob golden intact)')
 
 
 def main():
@@ -287,17 +322,36 @@ def main():
                 ram[base + i] = w
 
     # 5. Write @address hex format for $readmemh
+    dma_bus_width = int(os.environ.get('NPU_DMA_BUS_WIDTH', '32'))
+    if dma_bus_width not in (32, 64, 128):
+        raise SystemExit(f"Unsupported NPU_DMA_BUS_WIDTH={dma_bus_width}; must be 32, 64, or 128")
+    bus_words = dma_bus_width // 32
+
+    if bus_words == 1:
+        out_ram = ram
+    else:
+        out_ram = {}
+        wide_addrs = sorted({addr // bus_words for addr in ram.keys()})
+        for waddr in wide_addrs:
+            val = 0
+            base_w = waddr * bus_words
+            for lane in range(bus_words):
+                w = ram.get(base_w + lane, 0) & 0xFFFFFFFF
+                val |= w << (32 * lane)
+            out_ram[waddr] = val
+
+    hex_digits = bus_words * 8
     with open(output_init, 'w') as f:
         prev_addr = -1
-        for addr in sorted(ram.keys()):
+        for addr in sorted(out_ram.keys()):
             if addr != prev_addr + 1:
                 f.write(f'@{addr:08X}\n')
-            f.write(f'{ram[addr]:08X}\n')
+            f.write(f'{out_ram[addr]:0{hex_digits}X}\n')
             prev_addr = addr
 
-    max_addr = max(ram.keys())
-    print(f"Output: {output_init} ({len(ram)} non-zero words, "
-          f"max addr 0x{MAIN_RAM_BASE + max_addr*4:08X})")
+    max_word_addr = max(ram.keys())
+    print(f"Output: {output_init} ({len(out_ram)} non-zero {dma_bus_width}b entries, "
+          f"max addr 0x{MAIN_RAM_BASE + max_word_addr*4:08X})")
 
 
 if __name__ == '__main__':
